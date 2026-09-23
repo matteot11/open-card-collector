@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.pytest_cache/
+.eggs/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+.vscode/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+
+# Project outputs & artifacts
+output/
+output_test/
+*.db
+.DS_Store
+
+# Training artifacts & datasets
+data/
+runs/
+weights/*.pt
+
+# Queries
+*.sql
