@@ -1,178 +1,336 @@
 # Open Card Collector
 
-Open source prototype for detecting Magic: The Gathering cards in camera frames, rectifying detected cards, and retrieving local [Scryfall](https://scryfall.com/) catalog matches. Pokemon support and collection-management workflows are planned but not implemented.
+A local prototype for detecting Magic: The Gathering cards with YOLO OBB and retrieving candidate Scryfall printings with DINOv3.
+
+> [!NOTE]
+> Work in progress. Accuracy, performance, and workflows may change. Collection management, OCR, multilingual retrieval, and Pokemon support are not implemented.
 
 ## Demo
 
 ![Camera pipeline demo](resources/sample_video.gif)
 
-## What This Project Wants to Do
+## Start Here
 
-Open Card Collector aims to become a local-first tool for turning camera captures of physical trading cards into a reviewable collection. A user should be able to point a camera at one or more cards, confirm the detected cards, inspect likely catalog matches, correct uncertain results, and eventually save the confirmed cards to a collection database.
+Follow **steps 1–4 to use the camera with the published models**. You do not need to train anything. Steps 5–8 are optional and explain how to build your own models. Run every command from the repository root.
 
-The project is intentionally built as several replaceable stages rather than as one closed-set classifier:
+- [1. Install](#1-install)
+- [2. Download the catalog and reference images](#2-download-the-catalog-and-reference-images)
+- [3. Build reference embeddings](#3-build-reference-embeddings)
+- [4. Run the camera](#4-run-the-camera)
+- [5. Prepare a detector dataset (optional)](#5-prepare-a-detector-dataset-optional)
+- [6. Train the detector (optional)](#6-train-the-detector-optional)
+- [7. Train the embedder (optional)](#7-train-the-embedder-optional)
+- [8. Use and test your own models (optional)](#8-use-and-test-your-own-models-optional)
 
-- A detector finds card boundaries and does not need to know the card's identity.
-- A perspective-correction step turns each detected quadrilateral into a standard card crop.
-- An embedder maps reference and camera images into the same visual feature space.
-- A local catalog search returns candidate printings for user review.
-- Future OCR and reranking stages will use text and edition-specific details to distinguish near-duplicate printings.
+## 1. Install
 
-The current repository contains the camera and visual-retrieval prototype. The full collection workflow, multilingual support, Pokemon support, OCR, and edition-aware reranking remain future work.
-
-Published weights are available on Hugging Face:
-
-- [Magic card detector](https://huggingface.co/matteot11/collector-mtg-detector-yolo11n-obb)
-- [DINOv3 card embedder](https://huggingface.co/matteot11/collector-mtg-embedder-dinov3-small)
-
-## Repository Workflows
-
-- [Data preparation](data_preparation): synchronize the Scryfall catalog, download reference images, generate detector backgrounds and synthetic scenes, and build catalog embeddings.
-- [Detector training](detector_training/README.md): train the YOLO OBB model with `train_yolo_obb.py`.
-- [Embedder training](embedder_training/README.md): fine-tune DINOv3 with `train_card_embeddings.py` and compare image pairs with the utility under `utils/`.
-- [Camera pipeline](pipeline/README.md): run `capture_camera.py` for live detection, perspective correction, and retrieval.
-
-## Architecture & Workflow
-
-1. **Camera Detection**:
-   - Processes live OpenCV camera frames with a YOLO11 OBB detector.
-   - Draws oriented card polygons and detector confidence scores.
-   - Press `c` to capture all cards detected in the current frame.
-2. **Perspective Correction**:
-   - Warps each detected quadrilateral into a standardized 1371x1920 px portrait crop.
-   - Keeps crops in memory; optionally saves them with `--captures-dir PATH`.
-3. **Visual Retrieval**:
-   - Embeds each captured crop with the published DINOv3-based embedder.
-   - Compares it with normalized reference embeddings stored in the local SQLite catalog.
-   - Prints ranked Scryfall matches, set codes, collector numbers, prices, scores, and orientation.
-4. **Review**:
-   - Displays the captured frame with the top match overlaid while the camera is paused.
-   - Press `c` or `r` to resume, or `q`/Escape to quit.
-
-## End-to-End Workflow
-
-### 1. Prepare the Local Catalog
-
-The project uses [Scryfall Default Cards export](https://scryfall.com/docs/api/bulk-data) for local Magic card metadata. The synchronizer stores the bulk archive, SQLite catalog, and reference-image cache under `data/scryfall_source`.
-
-```bash
-uv run python data_preparation/00.sync_scryfall_catalog.py \
-   --download-images
-```
-
-The published [detector](https://huggingface.co/matteot11/collector-mtg-detector-yolo11n-obb) and [embedder](https://huggingface.co/matteot11/collector-mtg-embedder-dinov3-small) are downloaded from Hugging Face when inference starts, while the Scryfall metadata and images must be prepared locally.
-
-For detector training, download original PNG templates separately from the embedder's JPEG reference cache. The downloader preserves the original image bytes, including any transparency around rounded card corners:
-
-```bash
-uv run python data_preparation/detector/00.download_scryfall_png.py \
-  --limit 2000
-```
-
-Templates are saved under `data/detector_training_data/scryfall_png`, the synthetic scene generator's default input directory. Existing valid PNGs are skipped; omit `--limit` to download all eligible templates. See the [detector training workflow](detector_training/README.md) for scene generation and training commands. This step is not required to run the published detector.
-
-### 2. Build Reference Embeddings
-
-The embedder processes the cached reference images and stores normalized vectors in `data/scryfall_source/catalog.sqlite`. Retrieval itself uses the stored embedding and catalog metadata; the reference image is needed when creating or refreshing that embedding. Therefore, every card that should be searchable needs a corresponding embedding, while its source image only needs to remain available if you may need to regenerate or update that embedding.
-
-```bash
-uv run python data_preparation/embedder/01.embed_scryfall_images.py \
-   --device auto
-```
-
-Rerun `00.sync_scryfall_catalog.py` when Scryfall publishes updated catalog data. Use `--download-images` if that update includes new or changed reference images. Then rerun `01.embed_scryfall_images.py` whenever new reference images have been added to the local cache, or when you want to populate embeddings that are missing from the local database. The embedding script skips unchanged images for the same model name. Use the same model name when building reference embeddings and running camera retrieval; weights are assumed to stay unchanged for that name. Existing embeddings do not need a migration or rebuild.
-
-### 3. Run Camera Detection
-
-The camera pipeline loads the published YOLO OBB detector, selects CUDA, MPS, or CPU, and processes live OpenCV frames. Press `c` to capture every card detected in the current frame and start retrieval for those crops.
-
-```bash
-uv run python pipeline/capture_camera.py
-```
-
-### 4. Rectify Card Crops
-
-For each detection, the pipeline orders the four predicted corners and applies a perspective transform to produce a 1371x1920 portrait crop. Crops are kept in memory for visual retrieval; no capture files are saved by default. To also save JPEG crops, specify an output directory:
-
-```bash
-uv run python pipeline/capture_camera.py --captures-dir data/captures
-```
-
-### 5. Retrieve Candidate Cards
-
-Each crop is embedded twice with the published DINOv3-based model: once upright and once rotated 180 degrees, so upside-down captures can still match upright reference cards. Both query vectors are L2-normalized and compared with the normalized vectors in the local SQLite catalog using cosine similarity. Matches from both orientations are ranked together; the pipeline prints the top candidates with card name, set code, collector number, available prices, score, and orientation.
-
-### 6. Review the Result
-
-The camera pauses on the captured frame and overlays the highest-ranked result. The terminal also lists the requested number of candidates, controlled by `--top-k`. The current prototype does not provide in-app confirmation, correction, or candidate selection; results must be inspected outside the application, especially for reprints, alternate treatments, foils, and unclear images.
-
-### 7. Improve and Retrain the Models
-
-Training is a separate data-preparation workflow. The detector workflow creates synthetic scenes from cached card images and backgrounds, then trains YOLO OBB. The embedder workflow fine-tunes DINOv3 with augmented views of cached card images. See the [detector training workflow](detector_training/README.md) and [embedder workflow](embedder_training/README.md) for the reproducible commands.
-
-## Installation
-
-Python 3.10 or newer is required. Use GUI-enabled OpenCV for camera windows; do not install `opencv-python-headless` alongside `opencv-python`.
-
-Install the base project and the detector/embedder dependencies:
+You need Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a desktop with a camera.
 
 ```bash
 uv sync --extra detector-training --extra embedder-training
 ```
 
-### GPU Acceleration
+Despite their names, these two extras also install the packages needed to run the published models. The defaults use the [YOLO11n OBB detector](https://huggingface.co/matteot11/collector-mtg-detector-yolo11n-obb) and [DINOv3 Small embedder](https://huggingface.co/matteot11/collector-mtg-embedder-dinov3-small); weights download on first use. Neither model includes the searchable catalog, which you prepare next.
 
-The scripts automatically select CUDA when an NVIDIA GPU is available, MPS on supported Apple Silicon systems, and CPU otherwise. The default PyTorch package resolution does not necessarily install CUDA support. NVIDIA users should select the PyTorch CUDA build matching their environment before syncing dependencies:
+Device selection is automatic: NVIDIA CUDA, Apple Silicon MPS, then CPU. Commands below use `--device auto`; substitute `mps`, `cpu`, or `cuda` when needed. YOLO commands also accept a CUDA index such as `0`.
+
+For NVIDIA GPUs, install a compatible CUDA-enabled PyTorch build. For example, if CUDA 12.4 suits your system:
 
 ```bash
 uv sync --extra detector-training --extra embedder-training --torch-backend=cu124
 ```
 
-Replace `cu124` with the CUDA build supported by your system. See the [PyTorch installation selector](https://pytorch.org/get-started/locally/) for available builds. Use `--device cpu`, `--device mps`, or `--device cuda` to override automatic device selection for supported commands.
+Choose the build using the [PyTorch installation selector](https://pytorch.org/get-started/locally/). Keep GUI-enabled `opencv-python`; do not install `opencv-python-headless` alongside it, because camera windows need GUI support.
 
-## Quick Camera Usage
+## 2. Download the Catalog and Reference Images
+
+The catalog contains card names, printing details, prices, and image URLs from Scryfall. The reference images are the scans against which camera captures will be matched.
 
 ```bash
-# Detect, capture, and retrieve cards from the default camera
-uv run python pipeline/capture_camera.py
-
-# Use an explicit camera and accelerator
-uv run python pipeline/capture_camera.py --camera 0 --device mps
+uv run python data_preparation/00.sync_scryfall_catalog.py --download-images
 ```
 
-The catalog must be synchronized, reference images must be downloaded, and embeddings must be computed before starting camera retrieval. See the [embedder workflow](embedder_training/README.md) and [camera pipeline README](pipeline/README.md).
+This downloads Scryfall's Default Cards export, imports it into SQLite, and downloads JPEG reference images. A complete image cache is large. To try a smaller subset, add `--image-limit 10000`: this run will attempt up to 10,000 missing or changed images. Running again skips successful downloads and continues with the remaining images. Leave the limit out to download all remaining images.
 
-## Performance
+| Location                                | Contents                                    |
+| --------------------------------------- | ------------------------------------------- |
+| `data/scryfall_source/bulk/`          | Bulk archive and export metadata            |
+| `data/scryfall_source/catalog.sqlite` | Card metadata, prices, and later embeddings |
+| `data/scryfall_source/images/`        | JPEG reference images                       |
 
-On an Apple M2 using MPS, the local YOLO11n OBB detector processed a saved 1280x720 synthetic scene at **43.4 FPS** (23.0 ms per frame on average, 640px inference size). Retrieving one saved card crop took **75.9 ms on average**: 61.2 ms to embed upright and upside-down views and 14.6 ms to search 113,993 local catalog embeddings for the top five matches.
+Use `--data-dir PATH` to choose another location. Without `--download-images`, the script updates metadata only. Cards without a top-level full-card image URL, including separately imaged multi-face cards, do not get a reference image through this workflow.
 
-These are warmed measurements over 20 iterations using the local v2 detector checkpoint and fine-tuned DINOv3 Small model. Detector FPS excludes camera acquisition and display; per-card retrieval time excludes perspective cropping, disk writes, and model loading. Live preview FPS and end-to-end capture latency will differ with hardware, image contents, and catalog size.
+### Keeping the Catalog Current
 
-## Data Provenance and Third-Party Rights
+Rerun this command when you want updated cards or prices, then rerun step 3. An unchanged bulk archive is reused. Missing images and changed image URLs are downloaded; unchanged cached images are skipped.
 
-The catalog synchronizer uses [Scryfall API and Default Cards bulk data](https://scryfall.com/docs/api/bulk-data). Scryfall is an independent third-party service and does not endorse this project. Review [Scryfall terms](https://scryfall.com/docs/terms) and applicable API/data guidance before using or redistributing downloaded data.
+The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `cached_image_url` is the URL of the last successful image download. If a replacement fails, the old image stays on disk and the next run retries.
 
-Card names, artwork, logos, and other card-related intellectual property belong to Wizards of the Coast and other respective rights holders. This repository does not distribute Scryfall catalog exports, downloaded card images, generated datasets containing card imagery, local SQLite catalogs, or derived catalog embeddings. Users are responsible for checking the rights and terms that apply to their use, storage, and redistribution of locally downloaded data.
+## 3. Build Reference Embeddings
 
-## Current Limitations
+An embedding is a numerical representation of an image. This command turns the downloaded reference images into vectors that can be searched quickly:
 
-- The published models and current retrieval evaluation target English-language Magic: The Gathering cards. The catalog synchronizer can store other Scryfall languages, but multilingual retrieval is not yet supported or evaluated.
-- Pokemon and other trading-card games are not supported by the current published models, despite the planned roadmap work.
-- Recognition depends on a locally synchronized Scryfall catalog, cached reference images, and matching local embeddings. The published models do not include this catalog or image data.
-- DINOv3 retrieval usually identifies the correct card, but can confuse reprints and variants with the same name when they differ only in small edition-specific details such as a set symbol, collector number, border, or layout.
-- The detector and embedder were trained primarily on synthetic camera views and may degrade with glare, sleeves, motion blur, strong occlusion, unusual lighting, extreme perspective, or very small cards.
-- Retrieval results are candidates rather than guaranteed identifications. The current prototype does not let users confirm or correct a result in the application; close matches require external review, especially for printings, languages, foils, showcase cards, and alternate treatments.
-- The current camera workflow is local-first and expects a desktop environment with an accessible OpenCV camera. Camera orientation and device-specific behavior may vary, especially with phone or Continuity Camera sources.
+```bash
+uv run python data_preparation/embedder/01.embed_scryfall_images.py --device auto
+```
 
-## Roadmap
+Vectors are stored in `catalog.sqlite`. **Only cards with reference embeddings can be retrieved.** Downloading model weights or catalog metadata alone is not enough. Images are needed to create or refresh embeddings, but not to search vectors already stored in the database.
 
-- [ ] Improve Magic printing identification with a candidate reranker to distinguish editions and variants.
-- [ ] Add user review for uncertain retrieval results: show ranked candidates, allow search and manual selection, and record corrections for evaluation.
-- [ ] Add Pokemon support in stages:
-  - Add a Pokemon catalog provider and local image/metadata synchronization workflow.
-  - Build and evaluate a labeled mixed-game camera dataset.
-  - Decide from benchmarks whether the detector needs `mtg` and `pokemon` classes, or whether a game-agnostic `card` detector plus a separate game classifier is more accurate and maintainable.
-  - Train game-specific retrieval catalogs and use game classification only to select or prioritize the appropriate catalog.
-- [ ] Add reproducible retrieval benchmarks for exact printing identification, including held-out camera captures, alternate artwork, glare, sleeves, occlusion, rotation, and near-duplicate printings.
-- [ ] Version published detector and embedder weights, record their source commit and evaluation results, and keep model cards synchronized with each release.
-- [ ] Document data provenance and licensing boundaries, including that card images, catalog exports, generated datasets, local SQLite catalogs, and catalog embeddings are not distributed with this repository.
+| Option                         | Meaning                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------------------- |
+| `--data-dir PATH`            | Use the same data directory as step 2                                                       |
+| `--batch-size 8`             | Process fewer images at once to reduce memory use; default is 16                            |
+| `--limit 1000`               | Process up to 1,000 images that do not have a current embedding; omit for all cached images |
+| `--model MODEL_OR_DIRECTORY` | Use a different published embedder or local model; see step 8                               |
+
+Rerunning skips unchanged images already embedded with the same model name. If you used download or embedding limits for a trial, rerun both steps without limits to complete the index.
+
+## 4. Run the Camera
+
+```bash
+uv run python pipeline/capture_camera.py --device auto
+```
+
+The default camera is index 0. Use `--camera 1` to try another camera. The program detects cards continuously; retrieval starts when you capture a frame.
+
+| Key                          | Action                                                     |
+| ---------------------------- | ---------------------------------------------------------- |
+| `c` during live preview    | Capture all detected cards and look up candidate printings |
+| `c` or `r` during review | Resume the live preview                                    |
+| `q` or Escape              | Quit                                                       |
+
+The captured frame pauses with the top match over each card. The terminal lists candidate names, set codes, collector numbers, available prices, similarity scores, and orientation. These are suggestions to inspect, not confirmed identifications. There is no in-app confirmation, correction, or collection saving yet.
+
+### Camera Options
+
+| Option                          | Default / meaning                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------- |
+| `--captures-dir PATH`         | No files saved by default; supply a directory to save JPEG crops                          |
+| `--top-k N`                   | Show 5 distinct candidate printings; cannot exceed the number of indexed cards            |
+| `--camera N`                  | Camera index 0                                                                            |
+| `--width W --height H`        | Request a camera resolution; supply both                                                  |
+| `--imgsz N`                   | Detector input size 640                                                                   |
+| `--confidence SCORE`          | Detection threshold 0.75                                                                  |
+| `--max-det N`                 | At most 100 detections per frame                                                          |
+| `--device DEVICE`             | `auto`, `mps`, `cpu`, or CUDA such as `0` / `cuda:0`                            |
+| `--recognition-data-dir PATH` | `data/scryfall_source`; must contain your prepared `catalog.sqlite`                   |
+| `--model MODEL`               | Published detector by default; accepts a local OBB`.pt` file or Hugging Face repository |
+| `--embedding-model MODEL`     | Published embedder by default; custom model usage is explained in step 8                  |
+
+For example, to save crops as well as retrieve them:
+
+```bash
+uv run python pipeline/capture_camera.py --device auto --captures-dir data/captures
+```
+
+Camera frames can be portrait or landscape. Requested resolution and phone/Continuity Camera behavior depend on the device.
+
+### What Happens After Capture
+
+YOLO detects oriented rectangles. Their corners are ordered and warped to 1371x1920 portrait crops in memory; this is not a separate estimate of the card's true perspective corners. DINOv3 embeds each crop upright and rotated 180 degrees, then compares its L2-normalized CLS vectors to the catalog using cosine similarity. Each printing keeps its best orientation before selecting the top matches.
+
+Cards are processed one at a time, and review appears after all finish. Optional JPEG saving is separate from retrieval: failed writes do not suppress matches.
+
+**You can stop here if you only want to use the published models.** The remaining steps are for training your own.
+
+## 5. Prepare a Detector Dataset (Optional)
+
+The detector learns card geometry, not card names or printings. Its training images are synthetic scenes built from transparent card scans and backgrounds.
+
+### 5.1. Download PNG Card Templates
+
+You need the catalog from step 2, but JPEG downloads and reference embeddings are not required if you are only training the detector. For metadata alone, run step 2's command without `--download-images`.
+
+```bash
+uv run python data_preparation/detector/00.download_scryfall_png.py --limit 2000
+```
+
+This tries to download up to 2,000 missing or invalid PNGs. Already downloaded valid PNGs are skipped and do not count toward the limit; failed attempts do count. Run again to continue downloading, or remove `--limit 2000` to try every remaining PNG.
+
+Use original Scryfall PNGs with their alpha channel (RGBA), which preserves transparent rounded corners. Do not substitute the JPEG reference cache from step 2. Opaque images can be loaded, but the compositor treats their entire rectangle as visible.
+
+The downloader reads `image_uris.png`, validates files, and saves original bytes without resizing or conversion under `data/detector_training_data/scryfall_png`. It skips cards without a top-level PNG URL, including separately imaged multi-face cards. Use `--database PATH` for a custom catalog and `--output-dir PATH` for another template directory; pass that directory to the scene generator's `--images-dir`.
+
+### 5.2. Prepare Backgrounds
+
+Use reviewed photos of card-free desks, playmats, or empty binders. Background discovery includes subdirectories. Cards already visible in a background would become unlabeled training examples.
+
+You can optionally generate backgrounds with FLUX.2 klein 4B:
+
+```bash
+uv sync --extra detector-training --extra embedder-training --extra background-generation
+uv run python data_preparation/detector/01.generate_diffusion_backgrounds.py \
+	--output-dir data/detector_training_data/backgrounds/generated_v3 \
+	--count 8 \
+	--dimensions 720x1280,1088x1920,1024x1024,1280x720,1920x1088 \
+	--seed 42
+```
+
+The first run downloads weights. Review these eight images before increasing `--count`. To use your own prompts, add `--prompts-file prompts.txt`, with one prompt per line; blank lines and lines beginning with `#` are ignored. Use the same background directory in the next command. Without local background images, the scene generator uses a procedural textured fallback.
+
+### 5.3. Generate Scenes
+
+Choose a new, empty output directory so different recipes are not mixed:
+
+```bash
+uv run python data_preparation/detector/02.create_synthetic_scenes.py \
+	--images-dir data/detector_training_data/scryfall_png \
+	--backgrounds-dir data/detector_training_data/backgrounds/generated_v3 \
+	--output-dir data/detector_training_data/synthetic/mtg_mobile_v3 \
+	--count 8000 \
+	--canvas-dimensions 720x1280,1088x1920,1280x720,1920x1088,1088x1088 \
+	--max-cards 20 \
+	--layout mixed \
+	--occlusion-probability 0.35 \
+	--seed 42
+```
+
+The result contains `images/`, `labels/`, and `scenes.jsonl`. Labels use YOLO OBB rows `class x1 y1 x2 y2 x3 y3 x4 y4`, with coordinates normalized by image width and height. The JSONL file records scene provenance, nominal card height, rotations, and quadrilaterals. Repeat dimensions in `--canvas-dimensions` to sample them more often.
+
+### Scene Recipe and Variations
+
+| Property              | Default v3 behavior / control                                                                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Layout                | One-third binder grids, two-thirds loose tabletop;`--layout mixed\|binder\|loose`                                                                                     |
+| Count and scale       | 1–20 cards, weighted toward 1–4;`--min-cards`, `--max-cards`. One physical scale per scene before camera projection; zoom changes between scenes                |
+| Camera                | Shared rotation up to +/-35 degrees, frame-corner perturbations up to 18%;`--camera-view-probability`                                                               |
+| Card rotation         | Binder +/-5 degrees, loose +/-25 degrees;`--full-rotation-probability` adds unrestricted loose scenes                                                               |
+| Visibility            | Cards fit inside the frame, so no truncated-card labels. Binder cards do not overlap; loose overlap retains at least 60% visibility                                   |
+| Overlap               | `--occlusion-probability` sets overlap attempts, not the final fraction of overlapping cards                                                                        |
+| Plastic and negatives | Half receive simplified sleeve borders; binder pockets add seams.`--sleeve-probability` controls sleeves; `--empty-scene-probability` defaults to 5% empty scenes |
+| Image effects         | Highlights, contact shadows, exposure gradients, white balance, low resolution, defocus/motion blur, noise, and JPEG compression                                      |
+
+These effects are approximations, not physically accurate plastic, foil, hands, or glare. Full rotation affects a fraction of loose scenes; it does not shrink every near-upright layout.
+
+For a square baseline, replace `--canvas-dimensions` with `--canvas-sizes 1024,1280,1536,1920`, use `--count 1700 --max-cards 4`, and choose a fresh output directory. For a separate dense stress dataset, use `--count 500 --canvas-dimensions 720x1280,1280x720,1024x1024 --min-cards 12 --max-cards 40 --occlusion-probability 0.55 --seed 43`. Keep stress scenes separate from the main training distribution.
+
+## 6. Train the Detector (Optional)
+
+Use the dataset created in step 5:
+
+```bash
+uv run python detector_training/train_yolo_obb.py \
+	--dataset-dir data/detector_training_data/synthetic/mtg_mobile_v3 \
+	--epochs 60 \
+	--imgsz 896 \
+	--batch 8 \
+	--device auto \
+	--output-dir runs/obb \
+	--name mtg_mobile_v3_yolo11n_obb
+```
+
+The example uses 896px input for extra detail and batch 8 to reduce memory use. Script defaults are 60 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
+
+The trainer creates a deterministic 85/15 scene split in `splits/train.txt` and `splits/val.txt`, plus `dataset.yaml`; `--validation-fraction` changes the ratio. It starts from `yolo11n-obb.pt` unless you supply `--model`.
+
+Rectangular batches group aspect ratios to reduce padding without stretching cards. Augmentation uses scale 75–125%, translation up to 8%, rotation +/-15 degrees, perspective 0.0005, and HSV changes 0.015/0.5/0.35. Mirroring, mosaic, mixup, CutMix, and copy-paste are disabled. Training uses pretrained weights, a deterministic seed, cosine learning rate, and patience 15.
+
+The usual result is `runs/obb/mtg_mobile_v3_yolo11n_obb/weights/best.pt`. Ultralytics can suffix existing run names; use the actual path printed by the trainer.
+
+### Resume an Interrupted Run
+
+```bash
+uv run python detector_training/train_yolo_obb.py \
+	--resume runs/obb/mtg_mobile_v3_yolo11n_obb/weights/last.pt \
+	--device auto
+```
+
+Resume requires an interrupted checkpoint with optimizer state and its original dataset, YAML, and split lists. It reuses the saved configuration; it does not create new splits. A completed checkpoint cannot resume; use `--model PATH/TO/best.pt` without `--resume` to start new fine-tuning. Start a new run when changing the training recipe.
+
+Synthetic validation is not proof of real-camera accuracy. Compare models on the same held-out labeled camera frames, with equal input size and confidence threshold. Include loose cards, binders, sleeves, glare, oblique views, small cards, and empty scenes; report recall and false positives.
+
+## 7. Train the Embedder (Optional)
+
+This workflow uses the JPEG references from step 2, not the synthetic detector scenes. Reference embeddings from step 3 are not needed for training. You need at least as many cached images as the requested batch size.
+
+```bash
+uv run python embedder_training/train_card_embeddings.py \
+	--data-dir data/scryfall_source \
+	--output-dir runs/embedder_training/dinov3-card-small \
+	--epochs 3 \
+	--batch-size 16 \
+	--device auto
+```
+
+The base model is `facebook/dinov3-vits16-pretrain-lvd1689m`. If Hugging Face requires access, accept its terms and authenticate in your terminal; never put tokens in scripts. Defaults are three epochs, batch 16, learning rate `1e-5`, temperature `0.07`, zero workers, and seed 42. The batch must be at least 2. Use `--model` to start from another compatible model or directory.
+
+For each card, two independently augmented views form a matching pair. Brightness, contrast, color, rotation, blur, and perspective vary. L2-normalized CLS embeddings are trained with symmetric InfoNCE: matching views should be close, other cards in the batch should be farther apart. The optimizer is AdamW with weight decay 0.05.
+
+The output directory holds the final model and processor. Each epoch also saves `checkpoint-NNN/` and `training_state.pt` containing epoch, optimizer state, loss, and arguments. There is no resume option: supplying a checkpoint through `--model` starts new training without restoring optimizer state.
+
+## 8. Use and Test Your Own Models (Optional)
+
+### Detector
+
+Pass your trained checkpoint to [capture_camera.py](pipeline/capture_camera.py):
+
+```bash
+uv run python pipeline/capture_camera.py --model runs/obb/mtg_mobile_v3_yolo11n_obb/weights/best.pt
+```
+
+Changing only the detector does not require new reference embeddings.
+
+### Embedder
+
+First build reference vectors with your trained embedder, then use the same directory for camera queries:
+
+```bash
+uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+	--model runs/embedder_training/dinov3-card-small
+uv run python pipeline/capture_camera.py \
+	--embedding-model runs/embedder_training/dinov3-card-small
+```
+
+`--model` in [01.embed_scryfall_images.py](data_preparation/embedder/01.embed_scryfall_images.py) and `--embedding-model` in [capture_camera.py](pipeline/capture_camera.py) must identify the same embedder, because reference and camera vectors must come from the same model. With neither option set, both use the same published default.
+
+Cache reuse checks image content and the model name or directory string, not model weights. If you train new weights, save them under a new directory and use it in both commands. Otherwise unchanged references could reuse vectors from the old weights. Existing vectors remain usable with the model that created them.
+
+### Compare Two Images
+
+```bash
+uv run python embedder_training/utils/compute_pair_similarity.py \
+	path/to/camera-crop.jpg path/to/reference.jpg \
+	--model runs/embedder_training/dinov3-card-small \
+	--device auto
+```
+
+Replace the two image paths with your files. The utility reports upright, 180-degree, and best cosine similarity; omit `--model` to use the published embedder. A pair score is not calibrated confidence or a full retrieval benchmark. Evaluate exact-printing ranking on held-out camera captures, especially similar editions and difficult lighting.
+
+## Performance and Limitations
+
+The demo FPS counter measures the live loop, including camera delivery and display. The following are **historical component timings**, not current v3 live-preview guarantees: Apple M2/MPS, local v2 detector, a saved 1280x720 synthetic scene, 640px inference, and 20 warmed iterations.
+
+| Measurement                                     | Result                  |
+| ----------------------------------------------- | ----------------------- |
+| Detector without camera acquisition or display  | 23.0 ms/frame, 43.4 FPS |
+| Upright and rotated embedding of one saved crop | 61.2 ms                 |
+| Top-five search over 113,993 reference vectors  | 14.6 ms                 |
+| Per-card embedding and search together          | 75.9 ms                 |
+
+Retrieval timings exclude cropping, JPEG writes, and model loading. Cold starts, card count, hardware, and frame contents affect real capture latency.
+
+- The evaluated models target English-language Magic cards. The catalog can store other languages, but multilingual recognition is not evaluated. Pokemon is not supported.
+- Similar reprints and variants can be confused, particularly when only small edition details differ.
+- Synthetic training may not cover glare, sleeves, blur, occlusion, extreme perspective, or very small cards well.
+- The intended collection workflow is detect, retrieve, review, correct, and save confirmed cards. Only detection and visual retrieval exist today.
+
+## Next Steps
+
+- Add user review, OCR, and edition-aware reranking for exact printing identification.
+- Evaluate held-out real captures and version model releases with source and evaluation results.
+- Add Pokemon catalogs and mixed-game evaluation before choosing detection or classification approaches.
+- Add collection management and multilingual support.
+
+## Help and Data Rights
+
+Every script supports `--help`, for example:
+
+```bash
+uv run python pipeline/capture_camera.py --help
+```
+
+Release metadata is maintained in the [detector model card](detector_training/huggingface_model_card.md) and [embedder model card](embedder_training/huggingface_model_card.md).
+
+Metadata and reference images come from [Scryfall](https://scryfall.com/docs/api/bulk-data), which does not endorse this project. Review its [terms](https://scryfall.com/docs/terms) and API guidance.
+
+Magic card names, artwork, and related intellectual property belong to Wizards of the Coast and their respective rights holders. Catalog exports, downloaded images, synthetic datasets, local databases, and catalog embeddings are local artifacts, not distributed here. You are responsible for rights governing their use, storage, and redistribution. Published model license and attribution details are in their model cards.
