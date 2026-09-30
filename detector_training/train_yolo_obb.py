@@ -19,7 +19,7 @@ def import_runtime():
     except ImportError as error:
         raise SystemExit(
             "Missing optional training dependencies. Install them with:\n"
-            "uv sync --extra training\n"
+            "uv sync --extra detector-training\n"
             "Then rerun this command."
         ) from error
     return torch, YOLO
@@ -124,12 +124,12 @@ def main() -> None:
     parser.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path("data/detector_training_data/synthetic/mtg_mobile_v2"),
+        default=Path("data/detector_training_data/synthetic/mtg_mobile_v3"),
     )
     parser.add_argument(
         "--model", default="yolo11n-obb.pt", help="Pretrained Ultralytics OBB model."
     )
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument(
         "--batch", type=int, default=16, help="Use -1 for CUDA auto-batch."
@@ -143,8 +143,12 @@ def main() -> None:
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/obb"))
-    parser.add_argument("--name", default="mtg_v1_yolo11n_obb")
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--name", default="mtg_mobile_v3_yolo11n_obb")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Interrupted last.pt checkpoint; reuse its saved configuration and splits.",
+    )
     args = parser.parse_args()
 
     if args.epochs <= 0 or args.imgsz <= 0 or args.workers < 0:
@@ -152,12 +156,41 @@ def main() -> None:
             "--epochs and --imgsz must be positive; --workers cannot be negative"
         )
 
+    if args.resume is not None and not args.resume.is_file():
+        parser.error(f"Resume checkpoint does not exist: {args.resume}")
+    torch, YOLO = import_runtime()
+    device = select_device(torch, args.device)
+    if args.resume is not None:
+        model = YOLO(str(args.resume))
+        checkpoint = model.ckpt or {}
+        if checkpoint.get("epoch", -1) < 0 or checkpoint.get("optimizer") is None:
+            parser.error(
+                "Checkpoint is not resumable; use --model for a new fine-tuning run"
+            )
+        data_path = checkpoint.get("train_args", {}).get("data")
+        if not isinstance(data_path, str) or not Path(data_path).is_file():
+            parser.error("The checkpoint's original dataset YAML is missing")
+        dataset_dir = Path(data_path).parent
+        for split in ("train.txt", "val.txt"):
+            split_path = dataset_dir / "splits" / split
+            if not split_path.is_file():
+                parser.error(f"Original split is missing: {split_path}")
+            paths = split_path.read_text(encoding="utf-8").splitlines()
+            if not paths or any(not Path(path).is_file() for path in paths):
+                parser.error(
+                    f"Original split is empty or references missing images: {split_path}"
+                )
+        print(
+            f"Resuming {args.resume} on {device} with original configuration and splits"
+        )
+        results = model.train(resume=str(args.resume), device=device)
+        print(f"Training complete. Results: {results.save_dir}")
+        return
+
     images = validate_dataset(args.dataset_dir)
     dataset_yaml = write_split_files(
         args.dataset_dir, images, args.validation_fraction, args.seed
     )
-    torch, YOLO = import_runtime()
-    device = select_device(torch, args.device)
     print(f"Training on {device} with {args.model}; dataset config: {dataset_yaml}")
 
     model = YOLO(args.model)
@@ -175,16 +208,20 @@ def main() -> None:
         pretrained=True,
         patience=15,
         cos_lr=True,
-        close_mosaic=10,
-        degrees=45.0,
+        rect=True,
+        mosaic=0.0,
+        mixup=0.0,
+        cutmix=0.0,
+        copy_paste=0.0,
+        degrees=15.0,
         translate=0.08,
-        scale=0.30,
+        scale=0.25,
         perspective=0.0005,
-        fliplr=0.5,
+        fliplr=0.0,
+        flipud=0.0,
         hsv_h=0.015,
         hsv_s=0.5,
         hsv_v=0.35,
-        resume=args.resume,
     )
     print(f"Training complete. Results: {results.save_dir}")
 

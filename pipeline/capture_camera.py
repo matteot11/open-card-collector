@@ -1,4 +1,4 @@
-"""Detect cards from a live camera and save perspective-corrected capture crops."""
+"""Detect and retrieve cards from a live camera, optionally saving capture crops."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from PIL import Image
 
 CARD_WIDTH = 1371
 CARD_HEIGHT = 1920
-DEFAULT_RECOGNITION_DATA_DIR = Path("data/skryfall_source")
+DEFAULT_RECOGNITION_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_EMBEDDING_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
 DEFAULT_DETECTOR_MODEL = "matteot11/collector-mtg-detector-yolo11n-obb"
 
@@ -25,8 +25,8 @@ def import_runtime():
         from ultralytics import YOLO
     except ImportError as error:
         raise SystemExit(
-            "Missing optional training dependencies. Install them with:\n"
-            "uv sync --extra training\n"
+            "Missing inference dependencies. Install them with:\n"
+            "uv sync --extra detector-training --extra embedder-training\n"
             "Then rerun this command."
         ) from error
     return torch, YOLO
@@ -35,9 +35,13 @@ def import_runtime():
 def select_device(torch, requested_device: str) -> str:
     """Use the requested device or select the best available accelerator."""
     if requested_device != "auto":
-        return requested_device
+        return (
+            f"cuda:{requested_device}"
+            if requested_device.isdigit()
+            else requested_device
+        )
     if torch.cuda.is_available():
-        return "0"
+        return "cuda:0"
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
@@ -48,7 +52,7 @@ def resolve_detector_checkpoint(model: str) -> Path:
     local_path = Path(model).expanduser()
     if local_path.is_file():
         return local_path
-    if "/" not in model:
+    if local_path.suffix == ".pt" or local_path.is_absolute() or "/" not in model:
         raise FileNotFoundError(f"Model checkpoint does not exist: {local_path}")
 
     try:
@@ -125,8 +129,8 @@ def load_catalog_embeddings(
 
     if not rows:
         raise RuntimeError(
-            "No matching reference embeddings found. Run "
-            "data_preparation/embedder/01.embed_scryfall_images.py first."
+            "No reference embeddings match this model name. Run "
+            "data_preparation/embedder/01.embed_scryfall_images.py with the same model name."
         )
     vectors = np.vstack([np.frombuffer(row[0], dtype=np.float32) for row in rows])
     details = [(row[1], row[2], row[3], row[4], row[5], row[6]) for row in rows]
@@ -161,16 +165,17 @@ def retrieve_cards(
     """Return top catalog matches across upright and 180-degree orientations."""
     query_vectors = embed_capture(image, processor, embedding_model, torch, device)
     scores = query_vectors @ catalog_vectors.T
-    candidates = []
-    for orientation, orientation_scores in enumerate(scores):
-        for index in np.argpartition(orientation_scores, -top_k)[-top_k:]:
-            candidates.append(
-                (
-                    float(orientation_scores[index]),
-                    orientation == 1,
-                    catalog_details[index],
-                )
-            )
+    best_scores = scores.max(axis=0)
+    best_orientations = scores.argmax(axis=0)
+    indices = np.argpartition(best_scores, -top_k)[-top_k:]
+    candidates = [
+        (
+            float(best_scores[index]),
+            bool(best_orientations[index]),
+            catalog_details[index],
+        )
+        for index in indices
+    ]
     return sorted(candidates, reverse=True, key=lambda candidate: candidate[0])[:top_k]
 
 
@@ -266,7 +271,7 @@ def draw_predictions(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Detect cards from a camera and save recognition-ready crops."
+        description="Detect and retrieve cards from a camera, optionally saving crops."
     )
     parser.add_argument(
         "--model",
@@ -277,7 +282,7 @@ def main() -> None:
     parser.add_argument("--width", type=int, help="Optional requested camera width.")
     parser.add_argument("--height", type=int, help="Optional requested camera height.")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference size.")
-    parser.add_argument("--confidence", type=float, default=0.85)
+    parser.add_argument("--confidence", type=float, default=0.75)
     parser.add_argument(
         "--device", default="auto", help="auto, mps, cpu, or CUDA index."
     )
@@ -285,8 +290,7 @@ def main() -> None:
     parser.add_argument(
         "--captures-dir",
         type=Path,
-        default=Path("data/captures"),
-        help="Directory for perspective-corrected card crops saved with c.",
+        help="Save captured card crops to this directory; disabled by default.",
     )
     parser.add_argument(
         "--recognition-data-dir",
@@ -319,7 +323,7 @@ def main() -> None:
     except ImportError as error:
         raise SystemExit(
             "Missing recognition dependencies. Install them with:\n"
-            "uv sync --extra recognition"
+            "uv sync --extra embedder-training"
         ) from error
     catalog_vectors, catalog_details = load_catalog_embeddings(
         args.recognition_data_dir / "catalog.sqlite", args.embedding_model
@@ -389,45 +393,48 @@ def main() -> None:
                 if not detections:
                     print("No card detected to capture.")
                     continue
-                args.captures_dir.mkdir(parents=True, exist_ok=True)
+                if args.captures_dir is not None:
+                    args.captures_dir.mkdir(parents=True, exist_ok=True)
                 capture_id = time.time_ns()
                 saved = 0
                 frozen_frame = capture_frame.copy()
                 frozen_matches = []
                 for index, (polygon, _) in enumerate(detections, start=1):
-                    output_path = (
-                        args.captures_dir / f"capture_{capture_id}_{index:02d}.jpg"
-                    )
                     crop = crop_card(capture_frame, polygon)
-                    if cv2.imwrite(str(output_path), crop):
-                        saved += 1
-                        matches = retrieve_cards(
-                            crop,
-                            catalog_vectors,
-                            catalog_details,
-                            processor,
-                            embedding_model,
-                            torch,
-                            device,
-                            args.top_k,
+                    print(f"\nCard {index}")
+                    if args.captures_dir is not None:
+                        output_path = (
+                            args.captures_dir / f"capture_{capture_id}_{index:02d}.jpg"
                         )
-                        if matches:
-                            frozen_matches.append((polygon, matches[0]))
-                        print(f"\n{output_path}")
-                        for rank, (score, rotated, details) in enumerate(
-                            matches, start=1
-                        ):
-                            _, name, set_code, collector_number, usd, eur = details
-                            orientation = "rotated" if rotated else "upright"
-                            print(
-                                f"  {rank}. {name} | {set_code.upper()} #{collector_number} "
-                                f"| {format_prices(usd, eur)} | {score:.3f} | {orientation}"
-                            )
-                    else:
-                        print(f"Could not write capture: {output_path}")
-                print(
-                    f"Captured {saved}/{len(detections)} cards in {args.captures_dir}"
-                )
+                        if cv2.imwrite(str(output_path), crop):
+                            saved += 1
+                            print(f"Saved {output_path}")
+                        else:
+                            print(f"Could not write capture: {output_path}")
+                    matches = retrieve_cards(
+                        crop,
+                        catalog_vectors,
+                        catalog_details,
+                        processor,
+                        embedding_model,
+                        torch,
+                        device,
+                        args.top_k,
+                    )
+                    if matches:
+                        frozen_matches.append((polygon, matches[0]))
+                    for rank, (score, rotated, details) in enumerate(matches, start=1):
+                        _, name, set_code, collector_number, usd, eur = details
+                        orientation = "rotated" if rotated else "upright"
+                        print(
+                            f"  {rank}. {name} | {set_code.upper()} #{collector_number} "
+                            f"| {format_prices(usd, eur)} | {score:.3f} | {orientation}"
+                        )
+                print(f"Captured {len(detections)} cards for retrieval")
+                if args.captures_dir is not None:
+                    print(
+                        f"Saved {saved}/{len(detections)} crops in {args.captures_dir}"
+                    )
                 for polygon, match in frozen_matches:
                     points = np.round(polygon).astype(np.int32).reshape((-1, 1, 2))
                     cv2.polylines(

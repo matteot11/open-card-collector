@@ -7,7 +7,7 @@ import gzip
 import json
 import os
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -16,7 +16,7 @@ from PIL import Image
 
 BULK_DATA_URL = "https://api.scryfall.com/bulk-data/default-cards"
 USER_AGENT = "OpenCardCollector/0.1 (local card catalog builder)"
-DEFAULT_DATA_DIR = Path("data/skryfall_source")
+DEFAULT_DATA_DIR = Path("data/scryfall_source")
 
 
 def request(url: str, *, stream: bool = False) -> requests.Response:
@@ -98,6 +98,9 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         )
         """)
     connection.execute("CREATE INDEX IF NOT EXISTS cards_name_index ON cards(name)")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
+    if "cached_image_url" not in columns:
+        connection.execute("ALTER TABLE cards ADD COLUMN cached_image_url TEXT")
     connection.execute("""
         CREATE TABLE IF NOT EXISTS card_prices (
             scryfall_id TEXT PRIMARY KEY,
@@ -131,7 +134,7 @@ def sync_catalog(
     connection = sqlite3.connect(database_path)
     initialize_database(connection)
     pending_images: list[tuple[str, str, Path]] = []
-    synced_at = datetime.now(UTC).isoformat()
+    synced_at = datetime.now(timezone.utc).isoformat()
     count = 0
     new_cards = 0
     changed_cards = 0
@@ -143,10 +146,10 @@ def sync_catalog(
             reference_url = image_url(card)
             destination = images_dir / f"{card_id}.jpg"
             previous = connection.execute(
-                "SELECT image_url, image_path, raw_json FROM cards WHERE scryfall_id = ?",
+                "SELECT image_url, image_path, raw_json, cached_image_url FROM cards WHERE scryfall_id = ?",
                 (card_id,),
             ).fetchone()
-            previous_url = previous[0] if previous else None
+            cached_url = previous[3] if previous else None
             raw_json = json.dumps(card, separators=(",", ":"))
             if previous is None:
                 new_cards += 1
@@ -155,7 +158,7 @@ def sync_catalog(
             if (
                 download_images
                 and reference_url
-                and (previous_url != reference_url or not destination.is_file())
+                and (cached_url != reference_url or not destination.is_file())
                 and (image_limit is None or len(pending_images) < image_limit)
             ):
                 pending_images.append((card_id, reference_url, destination))
@@ -270,8 +273,8 @@ def cache_images(
                     image.verify()
                 os.replace(temporary_path, destination)
                 connection.execute(
-                    "UPDATE cards SET image_path = ? WHERE scryfall_id = ?",
-                    (str(destination), card_id),
+                    "UPDATE cards SET image_path = ?, cached_image_url = ? WHERE scryfall_id = ?",
+                    (str(destination), url, card_id),
                 )
                 downloaded += 1
             except (OSError, requests.RequestException) as error:

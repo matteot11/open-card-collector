@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 from rich.progress import track
 
-DEFAULT_DATA_DIR = Path("data/skryfall_source")
+DEFAULT_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
 
 
@@ -61,10 +61,13 @@ def initialize_embedding_table(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (scryfall_id) REFERENCES cards(scryfall_id)
         )
         """)
+    connection.commit()
 
 
 def pending_images(
-    connection: sqlite3.Connection, model_name: str, limit: int | None
+    connection: sqlite3.Connection,
+    model_name: str,
+    limit: int | None,
 ) -> list[tuple[str, Path, str]]:
     """Find cached images that are new or whose file content changed."""
     rows = connection.execute(
@@ -101,17 +104,15 @@ def build_embeddings(
 
     torch, AutoModel, AutoProcessor = import_runtime()
     connection = sqlite3.connect(database_path)
-    initialize_embedding_table(connection)
-    pending = pending_images(connection, model_name, limit)
-    if not pending:
-        connection.close()
-        return 0, 0
-
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device).eval()
     embedded = 0
     failed = 0
     try:
+        initialize_embedding_table(connection)
+        pending = pending_images(connection, model_name, limit)
+        if not pending:
+            return 0, 0
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name).to(device).eval()
         for start in track(
             range(0, len(pending), batch_size), description="Embedding images"
         ):

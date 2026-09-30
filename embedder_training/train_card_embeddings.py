@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
-DEFAULT_DATA_DIR = Path("data/skryfall_source")
+DEFAULT_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 

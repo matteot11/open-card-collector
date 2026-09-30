@@ -23,9 +23,24 @@ This model detects Magic: The Gathering cards in camera frames and returns orien
 
 ## Training
 
-The detector was fine-tuned for 10 epochs with a batch size of 16 and seed `42`. Training used synthetic camera scenes containing rendered Magic card images, generated or custom backgrounds, perspective transformations, lighting effects, occlusion, and rotation.
+The detector was fine-tuned for 5 epochs with a batch size of 16 and seed `42`. Training used synthetic camera scenes containing rendered Magic card images, generated or custom backgrounds, perspective transformations, lighting effects, occlusion, and rotation.
+
+Training used rectangular batches on Apple MPS, rotation of +/-15 degrees, translation of 0.08, scale of 0.25, and perspective of 0.0005. Mirroring, mosaic, mixup, CutMix, and copy-paste were disabled.
 
 The synthetic scenes were created with the scripts in the [Open Card Collector](https://github.com/matteot11/open-card-collector) repository. The recorded Ultralytics run settings are included in `args.yaml`.
+
+## Synthetic Validation
+
+The final epoch's recorded validation metrics were:
+
+| Metric    | Value   |
+| --------- | ------- |
+| Precision | 0.99949 |
+| Recall    | 0.99977 |
+| mAP50     | 0.99500 |
+| mAP50-95  | 0.98727 |
+
+These results are from the synthetic validation split, not a real-camera benchmark, and do not establish equivalent performance on real footage.
 
 ## Usage
 

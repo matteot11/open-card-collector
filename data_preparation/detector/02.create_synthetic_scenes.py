@@ -23,10 +23,10 @@ BACKGROUND_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def load_templates(images_dir: Path) -> list[dict[str, str]]:
-    """Load all cached Scryfall scans directly from the embedder image cache."""
+    """Load local card templates, preferably original PNGs with transparency."""
     if not images_dir.is_dir():
         raise FileNotFoundError(
-            f"Embedder images directory does not exist: {images_dir}"
+            f"Template images directory does not exist: {images_dir}"
         )
     templates = [
         {
@@ -48,7 +48,7 @@ def load_background_paths(backgrounds_dir: Path) -> list[Path]:
         return []
     return sorted(
         path
-        for path in backgrounds_dir.iterdir()
+        for path in backgrounds_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in BACKGROUND_EXTENSIONS
     )
 
@@ -115,15 +115,42 @@ def make_background(
 def apply_camera_degradation(
     image: np.ndarray, randomizer: random.Random
 ) -> np.ndarray:
-    """Apply modest blur, sensor noise, and JPEG compression to the finished scene."""
-    blur_sigma = randomizer.uniform(0.0, 0.7)
+    """Vary illumination, camera resolution, focus, noise, and JPEG compression."""
+    height, width = image.shape[:2]
+    horizontal = np.linspace(-1, 1, width, dtype=np.float32)[None, :, None]
+    vertical = np.linspace(-1, 1, height, dtype=np.float32)[:, None, None]
+    illumination = (
+        randomizer.uniform(0.65, 1.25)
+        + horizontal * randomizer.uniform(-0.20, 0.20)
+        + vertical * randomizer.uniform(-0.20, 0.20)
+    )
+    balance = np.array([randomizer.uniform(0.90, 1.10) for _ in range(3)])
+    image = np.clip(image.astype(np.float32) * illumination * balance, 0, 255).astype(
+        np.uint8
+    )
+    if randomizer.random() < 0.35:
+        resolution = randomizer.uniform(0.45, 0.80)
+        reduced = cv2.resize(
+            image,
+            (max(1, round(width * resolution)), max(1, round(height * resolution))),
+        )
+        image = cv2.resize(reduced, (width, height), interpolation=cv2.INTER_LINEAR)
+    blur_sigma = randomizer.uniform(0.0, 1.2) * max(width, height) / 640
     if blur_sigma > 0.1:
         image = cv2.GaussianBlur(image, (0, 0), blur_sigma)
 
     noise_generator = np.random.default_rng(randomizer.randrange(2**32))
-    noise = noise_generator.normal(0, randomizer.uniform(0, 3), image.shape)
+    if randomizer.random() < 0.15:
+        kernel_size = randomizer.choice([3, 5, 7])
+        kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+        if randomizer.random() < 0.5:
+            kernel[kernel_size // 2, :] = 1.0 / kernel_size
+        else:
+            kernel[:, kernel_size // 2] = 1.0 / kernel_size
+        image = cv2.filter2D(image, -1, kernel)
+    noise = noise_generator.normal(0, randomizer.uniform(0, 6), image.shape)
     image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    quality = randomizer.randint(88, 100)
+    quality = randomizer.randint(65, 100)
     encoded, compressed = cv2.imencode(
         ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality]
     )
@@ -161,7 +188,7 @@ def card_quad_in_region(
     )
     quad = base_quad @ rotation.T
 
-    perspective_jitter = card_width * 0.08
+    perspective_jitter = card_width * 0.02
     quad += np.array(
         [
             [
@@ -188,10 +215,10 @@ def card_quad_in_region(
         [
             left
             + region_width / 2
-            + randomizer.uniform(-region_width * 0.08, region_width * 0.08),
+            + randomizer.uniform(-region_width * 0.02, region_width * 0.02),
             top
             + region_height / 2
-            + randomizer.uniform(-region_height * 0.08, region_height * 0.08),
+            + randomizer.uniform(-region_height * 0.02, region_height * 0.02),
         ],
         dtype=np.float32,
     )
@@ -231,8 +258,109 @@ def maximum_card_height(
     )
 
 
+def sample_scene_card_height(
+    regions: list[tuple[float, float, float, float]],
+    full_rotation_probability: float,
+    upright_rotation_degrees: float,
+    randomizer: random.Random,
+    scale_range: tuple[float, float] = (0.90, 0.98),
+) -> float:
+    """Sample one scale that fits every region at any permitted rotation."""
+    aspect_ratio = 2.5 / 3.5
+    limit = math.radians(
+        90.0 if full_rotation_probability > 0 else min(upright_rotation_degrees, 90.0)
+    )
+    width_angle = min(limit, math.atan(1.0 / aspect_ratio))
+    height_angle = min(limit, math.atan(aspect_ratio))
+    jitter_extent = 2.0 * aspect_ratio * 0.02
+    width_extent = (
+        aspect_ratio * math.cos(width_angle) + math.sin(width_angle) + jitter_extent
+    )
+    height_extent = (
+        math.cos(height_angle) + aspect_ratio * math.sin(height_angle) + jitter_extent
+    )
+    maximum = min(
+        min(width / width_extent, height / height_extent)
+        for _, _, width, height in regions
+    )
+    return maximum * randomizer.uniform(*scale_range)
+
+
+def preserves_card_visibility(quads: list[np.ndarray]) -> bool:
+    """Conservatively retain at least 60% of each card after all later overlays."""
+    for index, quad in enumerate(quads):
+        area = cv2.contourArea(quad)
+        if area <= 0:
+            return False
+        covered_area = sum(
+            cv2.intersectConvexConvex(quad, later)[0] for later in quads[index + 1 :]
+        )
+        if covered_area > area * 0.40:
+            return False
+    return True
+
+
+def project_scene_quads(
+    quads: list[np.ndarray],
+    canvas_width: int,
+    canvas_height: int,
+    randomizer: random.Random,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Apply a shared oblique camera view and keep every card fully in frame."""
+    source = np.array(
+        [[0, 0], [canvas_width, 0], [canvas_width, canvas_height], [0, canvas_height]],
+        dtype=np.float32,
+    )
+    destination = source.copy()
+    strength = randomizer.uniform(0.0, 0.18)
+    destination += np.array(
+        [
+            [
+                randomizer.uniform(-1, 1) * canvas_width * strength,
+                randomizer.uniform(-1, 1) * canvas_height * strength,
+            ]
+            for _ in range(4)
+        ],
+        dtype=np.float32,
+    )
+    perspective = cv2.getPerspectiveTransform(source, destination)
+    rotation = np.eye(3)
+    rotation[:2] = cv2.getRotationMatrix2D(
+        (canvas_width / 2, canvas_height / 2), randomizer.uniform(-35, 35), 1.0
+    )
+    transform = rotation @ perspective
+    projected = [cv2.perspectiveTransform(quad[None], transform)[0] for quad in quads]
+    points = np.concatenate(projected)
+    lower = points.min(axis=0)
+    upper = points.max(axis=0)
+    margin = min(canvas_width, canvas_height) * 0.02
+    scale = min(
+        1.0,
+        (canvas_width - 2 * margin) / (upper[0] - lower[0]),
+        (canvas_height - 2 * margin) / (upper[1] - lower[1]),
+    )
+    center = (lower + upper) / 2
+    fit = np.array(
+        [
+            [scale, 0, canvas_width / 2 - scale * center[0]],
+            [0, scale, canvas_height / 2 - scale * center[1]],
+            [0, 0, 1],
+        ],
+        dtype=np.float64,
+    )
+    transform = fit @ transform
+    return [
+        cv2.perspectiveTransform(quad[None], transform)[0] for quad in quads
+    ], transform
+
+
 def composite_card(
-    canvas: np.ndarray, template_path: Path, destination_quad: np.ndarray
+    canvas: np.ndarray,
+    template_path: Path,
+    destination_quad: np.ndarray,
+    randomizer: random.Random | None = None,
+    sleeved: bool = False,
+    binder: bool = False,
 ) -> None:
     """Warp a template scan into the canvas at an exact known quadrilateral."""
     template = cv2.imread(str(template_path), cv2.IMREAD_UNCHANGED)
@@ -240,27 +368,66 @@ def composite_card(
         raise ValueError(f"Could not load template: {template_path}")
 
     height, width = template.shape[:2]
+    if template.ndim == 2:
+        template = cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+    alpha = (
+        template[..., 3:4].astype(np.float32) / 255.0
+        if template.shape[2] == 4
+        else np.ones((height, width, 1), dtype=np.float32)
+    )
+    colors = template[..., :3].astype(np.float32)
+    if randomizer is not None:
+        colors *= randomizer.uniform(0.8, 1.15)
+        if randomizer.random() < (0.65 if sleeved or binder else 0.12):
+            horizontal = np.linspace(0, 1, width, dtype=np.float32)[None, :]
+            vertical = np.linspace(0, 1, height, dtype=np.float32)[:, None]
+            band = np.exp(
+                -(
+                    (
+                        (
+                            horizontal
+                            + vertical * randomizer.uniform(-0.7, 0.7)
+                            - randomizer.uniform(0.1, 0.9)
+                        )
+                        / randomizer.uniform(0.04, 0.15)
+                    )
+                    ** 2
+                )
+            )
+            glare = band[..., None] * randomizer.uniform(0.15, 0.50)
+            colors = colors * (1 - glare) + 255 * glare
+        overlay = canvas.copy()
+        shadow = destination_quad + np.array([3, 5], dtype=np.float32)
+        cv2.fillConvexPoly(overlay, shadow.astype(np.int32), (15, 15, 15))
+        cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0, dst=canvas)
+        if sleeved or binder:
+            center = destination_quad.mean(axis=0)
+            border = (destination_quad - center) * (1.06 if binder else 1.035) + center
+            color = randomizer.choice([(40, 40, 40), (180, 180, 180), (110, 80, 45)])
+            thickness = max(
+                1,
+                round(
+                    np.linalg.norm(destination_quad[1] - destination_quad[0]) * 0.012
+                ),
+            )
+            cv2.polylines(
+                canvas, [border.astype(np.int32)], True, color, thickness, cv2.LINE_AA
+            )
     source_quad = np.array(
         [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
         dtype=np.float32,
     )
     transform = cv2.getPerspectiveTransform(source_quad, destination_quad)
     canvas_height, canvas_width = canvas.shape[:2]
-    warped = cv2.warpPerspective(template, transform, (canvas_width, canvas_height))
-    if template.ndim == 3 and template.shape[2] == 4:
-        alpha = warped[..., 3:4].astype(np.float32) / 255.0
-        canvas[:] = (
-            warped[..., :3].astype(np.float32) * alpha
-            + canvas.astype(np.float32) * (1.0 - alpha)
-        ).astype(np.uint8)
-        return
-
-    mask = cv2.warpPerspective(
-        np.full((height, width), 255, dtype=np.uint8),
-        transform,
-        (canvas_width, canvas_height),
+    warped_colors = cv2.warpPerspective(
+        np.clip(colors, 0, 255) * alpha, transform, (canvas_width, canvas_height)
     )
-    cv2.copyTo(warped, mask, canvas)
+    warped_alpha = cv2.warpPerspective(alpha, transform, (canvas_width, canvas_height))[
+        ..., None
+    ]
+    canvas[:] = np.clip(
+        warped_colors + canvas.astype(np.float32) * (1 - warped_alpha), 0, 255
+    ).astype(np.uint8)
 
 
 def yolo_obb_line(quad: np.ndarray, canvas_width: int, canvas_height: int) -> str:
@@ -277,20 +444,35 @@ def placement_regions(
     canvas_height: int,
     cards_per_scene: int,
     randomizer: random.Random,
+    layout: str = "binder",
 ) -> list[tuple[float, float, float, float]]:
-    """Allocate distinct grid regions so dense scenes always have room to render."""
-    columns = math.ceil(math.sqrt(cards_per_scene))
+    """Center a compact portrait-cell grid resembling adjacent binder pockets."""
+    cell_aspect_ratio = 0.85
+    columns = max(
+        range(1, cards_per_scene + 1),
+        key=lambda candidate: min(
+            canvas_width / (candidate * cell_aspect_ratio),
+            canvas_height / math.ceil(cards_per_scene / candidate),
+        ),
+    )
     rows = math.ceil(cards_per_scene / columns)
-    cell_width = canvas_width / columns
-    cell_height = canvas_height / rows
+    cell_height = min(
+        canvas_width / (columns * cell_aspect_ratio), canvas_height / rows
+    )
+    cell_width = cell_height * cell_aspect_ratio
+    if layout == "loose":
+        cell_width = canvas_width / columns
+        cell_height = canvas_height / rows
+    grid_left = (canvas_width - columns * cell_width) / 2
+    grid_top = (canvas_height - rows * cell_height) / 2
     inset = max(2.0, min(canvas_width, canvas_height) * 0.003)
     regions = []
     for index in range(cards_per_scene):
         row, column = divmod(index, columns)
         regions.append(
             (
-                column * cell_width + inset,
-                row * cell_height + inset,
+                grid_left + column * cell_width + inset,
+                grid_top + row * cell_height + inset,
                 cell_width - 2 * inset,
                 cell_height - 2 * inset,
             )
@@ -305,8 +487,9 @@ def introduce_occlusion(
     canvas_width: int,
     canvas_height: int,
     randomizer: random.Random,
+    future_quads: list[np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Move a card toward its nearest predecessor while keeping it in frame."""
+    """Try an overlap without excessively covering any current or future card."""
     if not existing_quads:
         return quad
 
@@ -320,7 +503,10 @@ def introduce_occlusion(
     max_x, max_y = quad.max(axis=0)
     shift[0] = np.clip(shift[0], -min_x, canvas_width - 1 - max_x)
     shift[1] = np.clip(shift[1], -min_y, canvas_height - 1 - max_y)
-    return quad + shift
+    candidate = quad + shift
+    if preserves_card_visibility(existing_quads + [candidate] + (future_quads or [])):
+        return candidate
+    return quad
 
 
 def intersecting_card_indices(
@@ -347,40 +533,77 @@ def create_scene(
     full_rotation_probability: float,
     upright_rotation_degrees: float,
     randomizer: random.Random,
+    layout: str = "mixed",
+    camera_view_probability: float = 0.75,
+    sleeve_probability: float = 0.5,
 ) -> tuple[np.ndarray, list[dict[str, Any]], str]:
     """Compose one scene and return its image plus source/projection provenance."""
     canvas, background_source = make_background(
         background_paths, canvas_width, canvas_height, randomizer
     )
+    if cards_per_scene == 0:
+        return apply_camera_degradation(canvas, randomizer), [], background_source
+    layout = (
+        randomizer.choice(["binder", "loose", "loose"]) if layout == "mixed" else layout
+    )
+    rotation_probability = (
+        1.0 if randomizer.random() < full_rotation_probability else 0.0
+    )
+    local_rotation_limit = upright_rotation_degrees
+    if layout == "binder":
+        rotation_probability = 0.0
+        local_rotation_limit = min(5.0, upright_rotation_degrees)
     selected_templates = randomizer.sample(templates, k=cards_per_scene)
     scene_cards: list[dict[str, Any]] = []
     regions = placement_regions(
-        canvas_width, canvas_height, cards_per_scene, randomizer
+        canvas_width, canvas_height, cards_per_scene, randomizer, layout=layout
     )
+    card_height = sample_scene_card_height(
+        regions,
+        rotation_probability,
+        local_rotation_limit,
+        randomizer,
+        scale_range=(0.80, 0.98) if layout == "binder" else (0.45, 0.95),
+    )
+    angles = [
+        sample_card_rotation(rotation_probability, local_rotation_limit, randomizer)
+        for _ in regions
+    ]
+    planned_quads = [
+        card_quad_in_region(region, card_height, angle, randomizer)
+        for region, angle in zip(regions, angles, strict=True)
+    ]
+    camera_transform = np.eye(3)
+    if randomizer.random() < camera_view_probability:
+        planned_quads, camera_transform = project_scene_quads(
+            planned_quads, canvas_width, canvas_height, randomizer
+        )
     placed_quads: list[np.ndarray] = []
 
-    for template, region in zip(selected_templates, regions, strict=True):
-        _, _, region_width, region_height = region
-        close_up = cards_per_scene == 1
-        angle_degrees = sample_card_rotation(
-            full_rotation_probability, upright_rotation_degrees, randomizer
-        )
-        max_height = maximum_card_height(region_width, region_height, angle_degrees)
-        min_height = max_height * (0.84 if close_up else 0.78)
-        quad = card_quad_in_region(
-            region=region,
-            card_height=randomizer.uniform(min_height, max_height),
-            angle_degrees=angle_degrees,
-            randomizer=randomizer,
-        )
-        if randomizer.random() < occlusion_probability:
+    for card_index, (template, angle_degrees, quad) in enumerate(
+        zip(selected_templates, angles, planned_quads, strict=True)
+    ):
+        if layout != "binder" and randomizer.random() < occlusion_probability:
             quad = introduce_occlusion(
-                quad, placed_quads, canvas_width, canvas_height, randomizer
+                quad,
+                placed_quads,
+                canvas_width,
+                canvas_height,
+                randomizer,
+                future_quads=planned_quads[card_index + 1 :],
             )
 
         occluded_card_indices = intersecting_card_indices(quad, placed_quads)
 
-        composite_card(canvas, Path(template["template_path"]), quad)
+        sleeved = randomizer.random() < sleeve_probability
+        composite_card(
+            canvas,
+            Path(template["template_path"]),
+            quad,
+            randomizer,
+            sleeved=sleeved,
+            binder=layout == "binder",
+        )
         placed_quads.append(quad)
         for index in occluded_card_indices:
             scene_cards[index]["occluded_by_card_indices"].append(len(scene_cards))
@@ -389,6 +612,10 @@ def create_scene(
                 "template_scryfall_id": template["scryfall_id"],
                 "template_filename": template["filename"],
                 "rotation_degrees": round(angle_degrees, 3),
+                "layout": layout,
+                "sleeved": sleeved,
+                "camera_transform": camera_transform.round(6).tolist(),
+                "card_height_pixels": round(card_height, 3),
                 "quadrilateral_pixels": quad.round(3).tolist(),
                 "occludes_card_indices": occluded_card_indices,
                 "occluded_by_card_indices": [],
@@ -410,6 +637,10 @@ def create_dataset(
     full_rotation_probability: float,
     upright_rotation_degrees: float,
     seed: int,
+    layout: str = "mixed",
+    camera_view_probability: float = 0.75,
+    sleeve_probability: float = 0.5,
+    empty_scene_probability: float = 0.05,
 ) -> None:
     """Create image, label, and scene-provenance files for a synthetic OBB dataset."""
     if min_cards <= 0 or max_cards < min_cards:
@@ -420,6 +651,27 @@ def create_dataset(
         raise ValueError("full_rotation_probability must be between zero and one")
     if not 0.0 <= upright_rotation_degrees <= 180.0:
         raise ValueError("upright_rotation_degrees must be between zero and 180")
+    if layout not in {"mixed", "binder", "loose"}:
+        raise ValueError("layout must be mixed, binder, or loose")
+    for probability in (
+        camera_view_probability,
+        sleeve_probability,
+        empty_scene_probability,
+    ):
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "Scene augmentation probabilities must be between zero and one"
+            )
+    if (
+        image_count <= 0
+        or not canvas_dimensions
+        or any(width <= 0 or height <= 0 for width, height in canvas_dimensions)
+    ):
+        raise ValueError("Image count and canvas dimensions must be positive")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError(
+            f"Output directory must be empty; choose a fresh path: {output_dir}"
+        )
 
     templates = load_templates(images_dir)
     if max_cards > len(templates):
@@ -436,7 +688,12 @@ def create_dataset(
 
     with manifest_path.open("w", encoding="utf-8") as manifest:
         for index in track(range(image_count), description="Generating scenes"):
-            cards_per_scene = randomizer.randint(min_cards, max_cards)
+            if randomizer.random() < empty_scene_probability:
+                cards_per_scene = 0
+            elif min_cards <= 4 and randomizer.random() < 0.35:
+                cards_per_scene = randomizer.randint(min_cards, min(4, max_cards))
+            else:
+                cards_per_scene = randomizer.randint(min_cards, max_cards)
             canvas_width, canvas_height = randomizer.choice(canvas_dimensions)
             image, scene_cards, background_source = create_scene(
                 templates,
@@ -448,6 +705,9 @@ def create_dataset(
                 full_rotation_probability,
                 upright_rotation_degrees,
                 randomizer,
+                layout=layout,
+                camera_view_probability=camera_view_probability,
+                sleeve_probability=sleeve_probability,
             )
             stem = f"scene_{index:05d}"
             image_path = images_dir / f"{stem}.jpg"
@@ -474,6 +734,11 @@ def create_dataset(
                         "background_source": background_source,
                         "occlusion_probability": occlusion_probability,
                         "full_rotation_probability": full_rotation_probability,
+                        "generation_recipe": "camera_domain_v3",
+                        "layout": scene_cards[0]["layout"] if scene_cards else "empty",
+                        "camera_view_probability": camera_view_probability,
+                        "sleeve_probability": sleeve_probability,
+                        "empty_scene_probability": empty_scene_probability,
                         "cards": scene_cards,
                     }
                 )
@@ -525,8 +790,8 @@ def main() -> None:
     parser.add_argument(
         "--images-dir",
         type=Path,
-        default=Path("data/skryfall_source/images"),
-        help="Cached Scryfall scans used as card templates.",
+        default=Path("data/detector_training_data/scryfall_png"),
+        help="Original Scryfall PNG templates; alpha preserves rounded corners.",
     )
     parser.add_argument(
         "--backgrounds-dir",
@@ -537,7 +802,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/detector_training_data/synthetic/mtg_mobile_v2"),
+        default=Path("data/detector_training_data/synthetic/mtg_mobile_v3"),
     )
     parser.add_argument(
         "--count", type=int, default=10, help="Number of scenes to create."
@@ -559,24 +824,35 @@ def main() -> None:
         help="Comma-separated WIDTHxHEIGHT output dimensions chosen per scene.",
     )
     parser.add_argument("--min-cards", type=int, default=1)
-    parser.add_argument("--max-cards", type=int, default=24)
+    parser.add_argument("--max-cards", type=int, default=20)
+    parser.add_argument(
+        "--layout", choices=["mixed", "binder", "loose"], default="mixed"
+    )
+    parser.add_argument("--camera-view-probability", type=float, default=0.75)
+    parser.add_argument("--sleeve-probability", type=float, default=0.5)
+    parser.add_argument(
+        "--empty-scene-probability",
+        type=float,
+        default=0.05,
+        help="Fraction of card-free background scenes for false-positive training.",
+    )
     parser.add_argument(
         "--occlusion-probability",
         type=float,
         default=0.35,
-        help="Probability that each card after the first partially covers an earlier card.",
+        help="Probability of attempting an overlap; every card retains at least 60%% visibility.",
     )
     parser.add_argument(
         "--full-rotation-probability",
         type=float,
-        default=0.7,
-        help="Probability that a card uses a full [-180, 180] degree rotation.",
+        default=0.1,
+        help="Probability of a full-orientation scene; otherwise near-upright local rotations.",
     )
     parser.add_argument(
         "--upright-rotation-degrees",
         type=float,
         default=25.0,
-        help="Maximum absolute rotation for the remaining near-upright cards.",
+        help="Maximum local near-upright rotation, before the shared camera transform.",
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -604,6 +880,10 @@ def main() -> None:
         full_rotation_probability=args.full_rotation_probability,
         upright_rotation_degrees=args.upright_rotation_degrees,
         seed=args.seed,
+        layout=args.layout,
+        camera_view_probability=args.camera_view_probability,
+        sleeve_probability=args.sleeve_probability,
+        empty_scene_probability=args.empty_scene_probability,
     )
 
 
