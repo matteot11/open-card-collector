@@ -64,7 +64,7 @@ Use `--data-dir PATH` to choose another location. Without `--download-images`, t
 
 Rerun this command when you want updated cards or prices, then rerun step 3. An unchanged bulk archive is reused. Missing images and changed image URLs are downloaded; unchanged cached images are skipped.
 
-The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `cached_image_url` is the URL of the last successful image download. If a replacement fails, the old image stays on disk and the next run retries.
+The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `cached_image_url` is the URL of the last successful image download. If a replacement fails, the old image stays on disk and the next run retries. Each successful download is committed immediately, so interrupting the command does not lose completed download records.
 
 ## 3. Build Reference Embeddings
 

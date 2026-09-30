@@ -13,10 +13,23 @@ from typing import Any, Iterator
 
 import requests
 from PIL import Image
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+    track,
+)
 
 BULK_DATA_URL = "https://api.scryfall.com/bulk-data/default-cards"
 USER_AGENT = "OpenCardCollector/0.1 (local card catalog builder)"
 DEFAULT_DATA_DIR = Path("data/scryfall_source")
+CONSOLE = Console()
 
 
 def request(url: str, *, stream: bool = False) -> requests.Response:
@@ -33,7 +46,8 @@ def request(url: str, *, stream: bool = False) -> requests.Response:
 
 def synchronize_bulk(bulk_dir: Path) -> tuple[Path, bool]:
     """Reuse or download Scryfall's latest Default Cards bulk export."""
-    metadata = request(BULK_DATA_URL).json()
+    with CONSOLE.status("Checking Scryfall bulk export..."):
+        metadata = request(BULK_DATA_URL).json()
     bulk_url = metadata["jsonl_download_uri"]
     metadata_path = bulk_dir / "default-cards.metadata.json"
     bulk_path = bulk_dir / "default-cards.jsonl.gz"
@@ -53,10 +67,23 @@ def synchronize_bulk(bulk_dir: Path) -> tuple[Path, bool]:
     with (
         request(bulk_url, stream=True) as response,
         temporary_path.open("wb") as output,
+        Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=CONSOLE,
+        ) as progress,
     ):
+        length = response.headers.get("Content-Length", "")
+        task = progress.add_task(
+            "Downloading bulk export", total=int(length) if length.isdigit() else None
+        )
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 output.write(chunk)
+                progress.update(task, advance=len(chunk))
     temporary_path.replace(bulk_path)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return bulk_path, True
@@ -91,6 +118,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             layout TEXT NOT NULL,
             released_at TEXT,
             image_url TEXT,
+            cached_image_url TEXT,
             image_path TEXT,
             image_status TEXT,
             updated_at TEXT NOT NULL,
@@ -98,9 +126,6 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         )
         """)
     connection.execute("CREATE INDEX IF NOT EXISTS cards_name_index ON cards(name)")
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
-    if "cached_image_url" not in columns:
-        connection.execute("ALTER TABLE cards ADD COLUMN cached_image_url TEXT")
     connection.execute("""
         CREATE TABLE IF NOT EXISTS card_prices (
             scryfall_id TEXT PRIMARY KEY,
@@ -140,6 +165,15 @@ def sync_catalog(
     changed_cards = 0
     changed_prices = 0
 
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        TextColumn("{task.completed:,.0f} cards processed"),
+        TimeElapsedColumn(),
+        console=CONSOLE,
+    )
+    task = progress.add_task("Importing catalog", total=None)
+    progress.start()
     try:
         for card in iter_cards(bulk_path):
             card_id = card["id"]
@@ -240,10 +274,12 @@ def sync_catalog(
                 ),
             )
             count += 1
+            progress.update(task, advance=1)
             if count % 1000 == 0:
                 connection.commit()
         connection.commit()
     finally:
+        progress.stop()
         connection.close()
     return (count, new_cards, changed_cards, changed_prices), pending_images
 
@@ -258,7 +294,14 @@ def cache_images(
     connection = sqlite3.connect(database_path)
     downloaded = 0
     try:
-        for index, (card_id, url, destination) in enumerate(pending_images, start=1):
+        for index, (card_id, url, destination) in enumerate(
+            track(
+                pending_images,
+                description="Downloading reference images",
+                console=CONSOLE,
+            ),
+            start=1,
+        ):
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = destination.with_suffix(".partial")
             try:
@@ -276,11 +319,14 @@ def cache_images(
                     "UPDATE cards SET image_path = ?, cached_image_url = ? WHERE scryfall_id = ?",
                     (str(destination), url, card_id),
                 )
+                connection.commit()
                 downloaded += 1
             except (OSError, requests.RequestException) as error:
                 temporary_path.unlink(missing_ok=True)
-                print(f"[{index}/{len(pending_images)}] Failed {card_id}: {error}")
-        connection.commit()
+                CONSOLE.print(
+                    f"[{index}/{len(pending_images)}] Failed {card_id}: {error}",
+                    markup=False,
+                )
     finally:
         connection.close()
     return downloaded
