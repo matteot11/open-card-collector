@@ -50,7 +50,7 @@ The catalog contains card names, printing details, prices, and image URLs from S
 uv run python data_preparation/00.sync_scryfall_catalog.py --download-images
 ```
 
-This downloads Scryfall's Default Cards export, imports it into SQLite, and downloads JPEG reference images. A complete image cache is large. To try a smaller subset, add `--image-limit 10000`: this run will attempt up to 10,000 missing or changed images. Running again skips successful downloads and continues with the remaining images. Leave the limit out to download all remaining images.
+This downloads Scryfall's Default Cards export, imports it into SQLite, and downloads JPEG reference images. The full bulk export, catalog, and reference image cache together use about 20 GB of disk space, growing as Scryfall adds cards. To try a smaller subset, add `--image-limit 10000`: this run will attempt up to 10,000 missing or changed images. Running again skips successful downloads and continues with the remaining images. Leave the limit out to download all remaining images.
 
 | Location                                | Contents                                    |
 | --------------------------------------- | ------------------------------------------- |
