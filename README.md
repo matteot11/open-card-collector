@@ -321,6 +321,10 @@ Retrieval timings exclude cropping, JPEG writes, and model loading. Cold starts,
 - Add Pokemon catalogs and mixed-game evaluation before choosing detection or classification approaches.
 - Add collection management and multilingual support.
 
+## License
+
+Original code and documentation in this repository are licensed under the [MIT License](LICENSE), copyright (c) 2026 Matteo Tomei. This license does not cover third-party dependencies, pretrained or fine-tuned model weights, datasets, or card images and artwork; those remain subject to their applicable licenses and terms. Using or distributing this project must also comply with those terms, including any applicable Ultralytics AGPL-3.0 obligations. The MIT license does not override them.
+
 ## Help and Data Rights
 
 Every script supports `--help`, for example:
