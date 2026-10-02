@@ -1,9 +1,9 @@
 # Open Card Collector
 
-A local prototype for detecting Magic: The Gathering cards with YOLO OBB and retrieving candidate Scryfall printings with DINOv3.
+A local prototype for detecting Magic: The Gathering and Pokemon cards with YOLO OBB and retrieving candidate printings with DINOv3.
 
 > [!NOTE]
-> Work in progress. Accuracy, performance, and workflows may change. Collection management, OCR, multilingual retrieval, and Pokemon support are not implemented.
+> Work in progress. Accuracy, performance, and workflows may change. Collection management, OCR, and multilingual retrieval are not implemented. The published camera models are MTG-only; Pokemon and mixed-game inference need a custom detector.
 
 ## Demo
 
@@ -66,6 +66,23 @@ Rerun this command when you want updated cards or prices, then rerun step 3. An 
 
 The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `cached_image_url` is the URL of the last successful image download. If a replacement fails, the old image stays on disk and the next run retries. Each successful download is committed immediately, so interrupting the command does not lose completed download records.
 
+### Pokemon Catalog (Optional)
+
+Pokemon data comes from the [TCGdex REST API](https://tcgdex.dev/rest). Each run adds up to 1,000 card details and prices to a separate local catalog. Repeat the command to continue through the catalog; use `--refresh` to refresh existing details and prices. `--download-images` caches high-quality JPEG references for the embedder. PNG detector templates are downloaded separately in step 5.1.
+
+```bash
+uv run python data_preparation/pokemon/00.sync_tcgdex_catalog.py --download-images
+```
+
+| Location | Contents |
+| -------- | -------- |
+| `data/pokemon_source/catalog.sqlite` | Pokemon card metadata, local Cardmarket/TCGplayer prices, and later embeddings |
+| `data/pokemon_source/images/` | Cached TCGdex JPEG reference images used for embedding and retrieval |
+
+The script downloads available Cardmarket and TCGplayer pricing through TCGdex into the user's local SQLite database. Cardmarket summary values are stored in `pokemon_card_prices`; TCGplayer values are stored separately per finish (such as normal or reverse-holofoil) in `pokemon_tcgplayer_prices`, including currency, product IDs, update timestamps, and low/mid/high/market/direct-low prices. The full card response is retained in `raw_json`, preserving additional Cardmarket fields and variant-specific pricing. Missing prices remain unavailable, and `--refresh` replaces local price snapshots rather than retaining stale variants. Camera retrieval currently displays the Cardmarket summary estimate.
+
+This repository distributes downloader code, not downloaded pricing databases. TCGdex asks bulk API users to cache locally; users must still follow TCGdex and applicable upstream provider access and usage terms. The project's MIT license does not license marketplace data or Pokemon artwork. Publishing local price dumps, cached images, database exports, or derived datasets is a separate action requiring appropriate permission.
+
 ## 3. Build Reference Embeddings
 
 An embedding is a numerical representation of an image. This command turns the downloaded reference images into vectors that can be searched quickly:
@@ -85,6 +102,25 @@ Vectors are stored in `catalog.sqlite`. **Only cards with reference embeddings c
 
 Rerunning skips unchanged images already embedded with the same model name. If you used download or embedding limits for a trial, rerun both steps without limits to complete the index.
 
+For Pokemon, build vectors using the same selected model name that you will use for inference:
+
+```bash
+uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+	--game pokemon \
+	--model facebook/dinov3-vits16-pretrain-lvd1689m
+```
+
+To test one shared embedder for both games, use the same `--model` value for both catalogs. Each catalog keeps its own model-keyed vector table:
+
+```bash
+uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+	--game mtg \
+	--model runs/embedder_training/dinov3-mtg-pokemon
+uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+	--game pokemon \
+	--model runs/embedder_training/dinov3-mtg-pokemon
+```
+
 ## 4. Run the Camera
 
 ```bash
@@ -92,6 +128,17 @@ uv run python pipeline/capture_camera.py --device auto
 ```
 
 The default camera is index 0. Use `--camera 1` to try another camera. The program detects cards continuously; retrieval starts when you capture a frame.
+
+The default published detector and embedder are MTG-only. Pokemon-only or mixed-game inference requires a trained detector; mixed mode needs class names `mtg,pokemon` in that order:
+
+```bash
+uv run python pipeline/capture_camera.py \
+	--game both \
+	--model runs/obb/mtg_pokemon_v1_yolo11n_obb/weights/best.pt \
+	--embedding-model facebook/dinov3-vits16-pretrain-lvd1689m
+```
+
+Run the catalog sync and embedding step for both games first. In mixed mode, YOLO's predicted class routes each crop to the corresponding SQLite catalog. `--game pokemon` can be used with a Pokemon detector; `--game mtg` preserves the existing published MTG default.
 
 | Key                          | Action                                                     |
 | ---------------------------- | ---------------------------------------------------------- |
@@ -151,6 +198,14 @@ Use original Scryfall PNGs with their alpha channel (RGBA), which preserves tran
 
 The downloader reads `image_uris.png`, validates files, and saves original bytes without resizing or conversion under `data/detector_training_data/scryfall_png`. It skips cards without a top-level PNG URL, including separately imaged multi-face cards. Use `--database PATH` for a custom catalog and `--output-dir PATH` for another template directory; pass that directory to the scene generator's `--images-dir`.
 
+Pokemon detector templates are downloaded separately from the synced catalog, mirroring the MTG workflow:
+
+```bash
+uv run python data_preparation/detector/00.download_tcgdex_png.py --limit 1000
+```
+
+`--limit 1000` bounds each run to 1,000 missing templates, so rerunning resumes with the next batch and eventually reports `Pokemon PNG templates downloaded: 0`. Omit `--limit` to attempt every remaining template in one run. Files are stored under `data/detector_training_data/pokemon_png`. TCGdex PNG alpha is preserved; for legacy scans whose PNG has an opaque background, this detector downloader adds an antialiased rounded-corner alpha mask while retaining the visible card border. Embedder references remain separate JPEG files in `data/pokemon_source/images/`. For a Pokemon-only dataset, use `--game pokemon --images-dir data/detector_training_data/pokemon_png`; train it with `--class-names pokemon` and run the camera with `--game pokemon`.
+
 ### 5.2. Prepare Backgrounds
 
 Use reviewed photos of card-free desks, playmats, or empty binders. Background discovery includes subdirectories. Cards already visible in a background would become unlabeled training examples.
@@ -187,6 +242,22 @@ uv run python data_preparation/detector/02.create_synthetic_scenes.py \
 
 The result contains `images/`, `labels/`, and `scenes.jsonl`. Labels use YOLO OBB rows `class x1 y1 x2 y2 x3 y3 x4 y4`, with coordinates normalized by image width and height. The JSONL file records scene provenance, nominal card height, rotations, and quadrilaterals. Repeat dimensions in `--canvas-dimensions` to sample them more often.
 
+To create a mixed dataset with both detector classes, supply both image directories. Card classes are balanced as evenly as each scene's card count allows, and labels use class 0 for MTG and class 1 for Pokemon:
+
+```bash
+uv run python data_preparation/detector/02.create_synthetic_scenes.py \
+	--game both \
+	--images-dir data/detector_training_data/scryfall_png \
+	--pokemon-images-dir data/detector_training_data/pokemon_png \
+	--output-dir data/detector_training_data/synthetic/mtg_pokemon_v1 \
+	--count 8000 \
+	--canvas-dimensions 720x1280,1088x1920,1280x720,1920x1088,1088x1088 \
+	--max-cards 20 \
+	--layout mixed \
+	--occlusion-probability 0.35 \
+	--seed 42
+```
+
 ### Scene Recipe and Variations
 
 | Property              | Default v3 behavior / control                                                                                                                                         |
@@ -220,6 +291,20 @@ uv run python detector_training/train_yolo_obb.py \
 ```
 
 The example uses 896px input for extra detail and batch 8 to reduce memory use. Script defaults are 60 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
+
+Train a two-class model on the mixed dataset from the previous section with:
+
+```bash
+uv run python detector_training/train_yolo_obb.py \
+	--dataset-dir data/detector_training_data/synthetic/mtg_pokemon_v1 \
+	--class-names mtg,pokemon \
+	--epochs 60 \
+	--imgsz 896 \
+	--batch 8 \
+	--device auto \
+	--output-dir runs/obb \
+	--name mtg_pokemon_v1_yolo11n_obb
+```
 
 The trainer creates a deterministic 85/15 scene split in `splits/train.txt` and `splits/val.txt`, plus `dataset.yaml`; `--validation-fraction` changes the ratio. It starts from `yolo11n-obb.pt` unless you supply `--model`.
 
@@ -256,6 +341,19 @@ The base model is `facebook/dinov3-vits16-pretrain-lvd1689m`. If Hugging Face re
 
 For each card, two independently augmented views form a matching pair. Brightness, contrast, color, rotation, blur, and perspective vary. L2-normalized CLS embeddings are trained with symmetric InfoNCE: matching views should be close, other cards in the batch should be farther apart. The optimizer is AdamW with weight decay 0.05.
 
+For a shared model, train on both cached image catalogs with per-game-balanced sampling:
+
+```bash
+uv run python embedder_training/train_card_embeddings.py \
+	--game both \
+	--data-dir data/scryfall_source \
+	--pokemon-data-dir data/pokemon_source \
+	--output-dir runs/embedder_training/dinov3-mtg-pokemon \
+	--device auto
+```
+
+Use that output directory as `--model` when building embeddings for each catalog and as `--embedding-model` during inference. A single jointly trained model is the simplest starting point; compare it against per-game models on held-out real camera photos before deciding it is sufficient.
+
 The output directory holds the final model and processor. Each epoch also saves `checkpoint-NNN/` and `training_state.pt` containing epoch, optimizer state, loss, and arguments. There is no resume option: supplying a checkpoint through `--model` starts new training without restoring optimizer state.
 
 ## 8. Use and Test Your Own Models (Optional)
@@ -281,7 +379,7 @@ uv run python pipeline/capture_camera.py \
 	--embedding-model runs/embedder_training/dinov3-card-small
 ```
 
-`--model` in [01.embed_scryfall_images.py](data_preparation/embedder/01.embed_scryfall_images.py) and `--embedding-model` in [capture_camera.py](pipeline/capture_camera.py) must identify the same embedder, because reference and camera vectors must come from the same model. With neither option set, both use the same published default.
+`--model` in [01.embed_scryfall_images.py](data_preparation/embedder/01.embed_scryfall_images.py) and `--embedding-model` in [capture_camera.py](pipeline/capture_camera.py) must identify the same embedder, because reference and camera vectors must come from the same model. MTG defaults to the published MTG embedder; Pokemon and mixed mode default to the DINOv3 base checkpoint, which is not fine-tuned for either game.
 
 Cache reuse checks image content and the model name or directory string, not model weights. If you train new weights, save them under a new directory and use it in both commands. Otherwise unchanged references could reuse vectors from the old weights. Existing vectors remain usable with the model that created them.
 
@@ -309,7 +407,7 @@ The demo FPS counter measures the live loop, including camera delivery and displ
 
 Retrieval timings exclude cropping, JPEG writes, and model loading. Cold starts, card count, hardware, and frame contents affect real capture latency.
 
-- The evaluated models target English-language Magic cards. The catalog can store other languages, but multilingual recognition is not evaluated. Pokemon is not supported.
+- The published models target English-language Magic cards. Pokemon and mixed-game support requires collecting the TCGdex catalog and training a two-class detector; no mixed-game pretrained detector is currently published.
 - Similar reprints and variants can be confused, particularly when only small edition details differ.
 - Synthetic training may not cover glare, sleeves, blur, occlusion, extreme perspective, or very small cards well.
 - The intended collection workflow is detect, retrieve, review, correct, and save confirmed cards. Only detection and visual retrieval exist today.
@@ -318,7 +416,7 @@ Retrieval timings exclude cropping, JPEG writes, and model loading. Cold starts,
 
 - Add user review, OCR, and edition-aware reranking for exact printing identification.
 - Evaluate held-out real captures and version model releases with source and evaluation results.
-- Add Pokemon catalogs and mixed-game evaluation before choosing detection or classification approaches.
+- Evaluate mixed-game detection and retrieval on held-out captures, including similar Pokemon variants and reprints.
 - Add collection management and multilingual support.
 
 ## License
@@ -335,6 +433,6 @@ uv run python pipeline/capture_camera.py --help
 
 Release metadata is maintained in the [detector model card](detector_training/huggingface_model_card.md) and [embedder model card](embedder_training/huggingface_model_card.md).
 
-Metadata and reference images come from [Scryfall](https://scryfall.com/docs/api/bulk-data), which does not endorse this project. Review its [terms](https://scryfall.com/docs/terms) and API guidance.
+MTG metadata and reference images come from [Scryfall](https://scryfall.com/docs/api/bulk-data), which does not endorse this project. Pokemon metadata, prices, and reference image URLs come from [TCGdex](https://tcgdex.dev/), which is not affiliated with Nintendo or The Pokemon Company. Review the [Scryfall terms](https://scryfall.com/docs/terms) and [TCGdex FAQ](https://tcgdex.dev/faq), [market-price documentation](https://tcgdex.dev/markets-prices), and the terms of upstream marketplace and artwork rights holders.
 
 Magic card names, artwork, and related intellectual property belong to Wizards of the Coast and their respective rights holders. Catalog exports, downloaded images, synthetic datasets, local databases, and catalog embeddings are local artifacts, not distributed here. You are responsible for rights governing their use, storage, and redistribution. Published model license and attribution details are in their model cards.

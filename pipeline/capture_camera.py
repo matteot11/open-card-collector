@@ -14,8 +14,11 @@ from PIL import Image
 CARD_WIDTH = 1371
 CARD_HEIGHT = 1920
 DEFAULT_RECOGNITION_DATA_DIR = Path("data/scryfall_source")
-DEFAULT_EMBEDDING_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
+DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
+DEFAULT_MTG_EMBEDDING_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
+DEFAULT_SHARED_EMBEDDING_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 DEFAULT_DETECTOR_MODEL = "matteot11/collector-mtg-detector-yolo11n-obb"
+CardDetails = tuple[str, str, str, str, str | None, str | None]
 
 
 def import_runtime():
@@ -105,35 +108,64 @@ def orient_frame(frame: np.ndarray, orientation: str) -> np.ndarray:
 
 
 def load_catalog_embeddings(
-    database_path: Path, model_name: str
-) -> tuple[np.ndarray, list[tuple[str, str, str, str, str | None, str | None]]]:
+    database_path: Path, model_name: str, game: str
+) -> tuple[np.ndarray, list[CardDetails]]:
     """Load normalized image embeddings and their card details into memory."""
+    if game not in {"mtg", "pokemon"}:
+        raise ValueError(f"Unsupported game: {game}")
     if not database_path.is_file():
         raise FileNotFoundError(f"Recognition catalog does not exist: {database_path}")
 
     connection = sqlite3.connect(database_path)
     try:
-        rows = connection.execute(
-            """
-                 SELECT embedding, scryfall_id, name, set_code, collector_number,
-                     usd, eur
-            FROM image_embeddings
-            JOIN cards USING (scryfall_id)
-                 LEFT JOIN card_prices USING (scryfall_id)
-            WHERE model_name = ?
-            """,
-            (model_name,),
-        ).fetchall()
+        embeddings_table = (
+            "image_embeddings" if game == "mtg" else "pokemon_embeddings"
+        )
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (embeddings_table,),
+        ).fetchone()
+        if table is None:
+            raise RuntimeError(
+                f"No {game} embedding table exists in {database_path}. "
+                "Build its reference embeddings first."
+            )
+        if game == "mtg":
+            rows = connection.execute(
+                """
+                     SELECT embedding, scryfall_id, name, set_code, collector_number,
+                         usd, eur
+                FROM image_embeddings
+                JOIN cards USING (scryfall_id)
+                     LEFT JOIN card_prices USING (scryfall_id)
+                WHERE model_name = ?
+                """,
+                (model_name,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                     SELECT embedding, card_id, name, set_id, local_id,
+                         NULL, COALESCE(trend, average)
+                FROM pokemon_embeddings
+                JOIN pokemon_cards USING (card_id)
+                     LEFT JOIN pokemon_card_prices USING (card_id)
+                WHERE model_name = ?
+                """,
+                (model_name,),
+            ).fetchall()
     finally:
         connection.close()
 
     if not rows:
         raise RuntimeError(
-            "No reference embeddings match this model name. Run "
+            f"No {game} reference embeddings match this model name. Run "
             "data_preparation/embedder/01.embed_scryfall_images.py with the same model name."
         )
     vectors = np.vstack([np.frombuffer(row[0], dtype=np.float32) for row in rows])
-    details = [(row[1], row[2], row[3], row[4], row[5], row[6]) for row in rows]
+    details: list[CardDetails] = [
+        (row[1], row[2], row[3], row[4], row[5], row[6]) for row in rows
+    ]
     return vectors, details
 
 
@@ -155,13 +187,13 @@ def embed_capture(
 def retrieve_cards(
     image: np.ndarray,
     catalog_vectors: np.ndarray,
-    catalog_details: list[tuple[str, str, str, str, str | None, str | None]],
+    catalog_details: list[CardDetails],
     processor,
     embedding_model,
     torch,
     device: str,
     top_k: int,
-) -> list[tuple[float, bool, tuple[str, str, str, str, str | None, str | None]]]:
+) -> list[tuple[float, bool, CardDetails]]:
     """Return top catalog matches across upright and 180-degree orientations."""
     query_vectors = embed_capture(image, processor, embedding_model, torch, device)
     scores = query_vectors @ catalog_vectors.T
@@ -179,20 +211,23 @@ def retrieve_cards(
     return sorted(candidates, reverse=True, key=lambda candidate: candidate[0])[:top_k]
 
 
-def format_prices(usd: str | None, eur: str | None) -> str:
-    """Format available Scryfall price estimates for display."""
+def format_prices(usd: str | None, eur: str | None, game: str) -> str:
+    """Format source-specific local price estimates for display."""
     prices = []
-    if usd is not None:
+    if usd is not None and game == "mtg":
         prices.append(f"${usd}")
     if eur is not None:
-        prices.append(f"EUR {eur}")
+        prices.append(
+            f"EUR {eur}" if game == "mtg" else f"Cardmarket estimate EUR {eur}"
+        )
     return " | ".join(prices) if prices else "price unavailable"
 
 
 def draw_capture_metadata(
     frame: np.ndarray,
     polygon: np.ndarray,
-    match: tuple[float, bool, tuple[str, str, str, str, str | None, str | None]],
+    match: tuple[float, bool, CardDetails],
+    game: str,
 ) -> None:
     """Draw a captured card's top retrieval result inside its detection box."""
     _, _, details = match
@@ -203,7 +238,7 @@ def draw_capture_metadata(
     label_lines = [
         name,
         f"{set_code.upper()} #{collector_number}",
-        format_prices(usd, eur),
+        format_prices(usd, eur, game),
     ]
     line_height = 23
     label_top = max(int(top) + 8, 8)
@@ -231,8 +266,8 @@ def draw_capture_metadata(
 
 
 def draw_predictions(
-    frame: np.ndarray, result, confidence_threshold: float
-) -> list[tuple[np.ndarray, float]]:
+    frame: np.ndarray, result, confidence_threshold: float, class_names: dict[int, str]
+) -> list[tuple[np.ndarray, float, int]]:
     """Draw one oriented polygon and confidence tag for each predicted card."""
     if result.obb is None:
         return []
@@ -240,7 +275,7 @@ def draw_predictions(
     polygons = result.obb.xyxyxyxy.cpu().numpy()
     confidences = result.obb.conf.cpu().numpy()
     class_ids = result.obb.cls.cpu().numpy().astype(int)
-    detections: list[tuple[np.ndarray, float]] = []
+    detections: list[tuple[np.ndarray, float, int]] = []
 
     for polygon, confidence, class_id in zip(
         polygons, confidences, class_ids, strict=True
@@ -250,11 +285,7 @@ def draw_predictions(
         points = np.round(polygon).astype(np.int32).reshape((-1, 1, 2))
         cv2.polylines(frame, [points], isClosed=True, color=(0, 230, 70), thickness=3)
         anchor_x, anchor_y = points[0, 0]
-        label = (
-            f"card {confidence:.0%}"
-            if class_id == 0
-            else f"class {class_id} {confidence:.0%}"
-        )
+        label = f"{class_names.get(class_id, f'class {class_id}')} {confidence:.0%}"
         cv2.putText(
             frame,
             label,
@@ -265,17 +296,40 @@ def draw_predictions(
             2,
             cv2.LINE_AA,
         )
-        detections.append((polygon, float(confidence)))
+        detections.append((polygon, float(confidence), class_id))
     return detections
+
+
+def class_game_mapping(class_names: dict[int, str]) -> dict[int, str]:
+    """Map trained YOLO class names to supported game names."""
+    aliases = {
+        "mtg": "mtg",
+        "magic": "mtg",
+        "magic: the gathering": "mtg",
+        "pokemon": "pokemon",
+        "pokémon": "pokemon",
+    }
+    mapping = {
+        class_id: aliases[name.strip().lower()]
+        for class_id, name in class_names.items()
+        if name.strip().lower() in aliases
+    }
+    if set(mapping.values()) != {"mtg", "pokemon"}:
+        raise RuntimeError(
+            "Mixed-game inference requires detector classes named mtg and pokemon "
+            "(in either order). Train with --class-names mtg,pokemon."
+        )
+    return mapping
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Detect and retrieve cards from a camera, optionally saving crops."
     )
+    parser.add_argument("--game", choices=("mtg", "pokemon", "both"), default="mtg")
     parser.add_argument(
         "--model",
-        default=DEFAULT_DETECTOR_MODEL,
+        default=None,
         help="Local Ultralytics OBB .pt checkpoint or Hugging Face model repository.",
     )
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
@@ -296,9 +350,19 @@ def main() -> None:
         "--recognition-data-dir",
         type=Path,
         default=DEFAULT_RECOGNITION_DATA_DIR,
-        help="Directory containing catalog.sqlite and reference embeddings.",
+        help="MTG data directory containing catalog.sqlite and embeddings.",
     )
-    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    parser.add_argument(
+        "--pokemon-data-dir",
+        type=Path,
+        default=DEFAULT_POKEMON_DATA_DIR,
+        help="Pokemon data directory containing catalog.sqlite and embeddings.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="One shared model used to build/query embeddings for every selected game.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
 
@@ -313,8 +377,13 @@ def main() -> None:
 
     torch, YOLO = import_runtime()
     device = select_device(torch, args.device)
+    detector_model_name = args.model or (
+        DEFAULT_DETECTOR_MODEL if args.game == "mtg" else ""
+    )
+    if not detector_model_name:
+        parser.error("--model is required for Pokemon or mixed-game detection")
     try:
-        detector_checkpoint = resolve_detector_checkpoint(args.model)
+        detector_checkpoint = resolve_detector_checkpoint(detector_model_name)
     except FileNotFoundError as error:
         parser.error(str(error))
     model = YOLO(str(detector_checkpoint))
@@ -325,15 +394,42 @@ def main() -> None:
             "Missing recognition dependencies. Install them with:\n"
             "uv sync --extra embedder-training"
         ) from error
-    catalog_vectors, catalog_details = load_catalog_embeddings(
-        args.recognition_data_dir / "catalog.sqlite", args.embedding_model
+    selected_games = ("mtg", "pokemon") if args.game == "both" else (args.game,)
+    embedding_model_name = args.embedding_model or (
+        DEFAULT_MTG_EMBEDDING_MODEL
+        if args.game == "mtg"
+        else DEFAULT_SHARED_EMBEDDING_MODEL
     )
-    if args.top_k > len(catalog_details):
-        parser.error(
-            f"--top-k cannot exceed {len(catalog_details)} available embeddings"
+    catalogs = {}
+    for game in selected_games:
+        data_dir = (
+            args.recognition_data_dir if game == "mtg" else args.pokemon_data_dir
         )
-    processor = AutoProcessor.from_pretrained(args.embedding_model)
-    embedding_model = AutoModel.from_pretrained(args.embedding_model).to(device).eval()
+        catalogs[game] = load_catalog_embeddings(
+            data_dir / "catalog.sqlite", embedding_model_name, game
+        )
+        if args.top_k > len(catalogs[game][1]):
+            parser.error(
+                f"--top-k cannot exceed {len(catalogs[game][1])} {game} embeddings"
+            )
+    processor = AutoProcessor.from_pretrained(embedding_model_name)
+    embedding_model = (
+        AutoModel.from_pretrained(embedding_model_name).to(device).eval()
+    )
+    raw_class_names = model.names
+    class_name_items = (
+        raw_class_names.items()
+        if isinstance(raw_class_names, dict)
+        else enumerate(raw_class_names)
+    )
+    class_names = {
+        int(class_id): str(name) for class_id, name in class_name_items
+    }
+    class_games = (
+        class_game_mapping(class_names)
+        if args.game == "both"
+        else {class_id: args.game for class_id in class_names}
+    )
     camera = cv2.VideoCapture(args.camera)
     if args.width is not None:
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -371,7 +467,9 @@ def main() -> None:
                 device=device,
                 verbose=False,
             )[0]
-            detections = draw_predictions(frame, result, args.confidence)
+            detections = draw_predictions(
+                frame, result, args.confidence, class_names
+            )
             now = time.perf_counter()
             fps = 1.0 / max(now - previous_time, 1e-6)
             previous_time = now
@@ -399,9 +497,15 @@ def main() -> None:
                 saved = 0
                 frozen_frame = capture_frame.copy()
                 frozen_matches = []
-                for index, (polygon, _) in enumerate(detections, start=1):
+                for index, (polygon, _, class_id) in enumerate(
+                    detections, start=1
+                ):
+                    game = class_games.get(class_id)
+                    if game is None or game not in catalogs:
+                        print(f"Skipping unsupported detector class {class_id}")
+                        continue
                     crop = crop_card(capture_frame, polygon)
-                    print(f"\nCard {index}")
+                    print(f"\n{game.upper()} card {index}")
                     if args.captures_dir is not None:
                         output_path = (
                             args.captures_dir / f"capture_{capture_id}_{index:02d}.jpg"
@@ -413,8 +517,8 @@ def main() -> None:
                             print(f"Could not write capture: {output_path}")
                     matches = retrieve_cards(
                         crop,
-                        catalog_vectors,
-                        catalog_details,
+                        catalogs[game][0],
+                        catalogs[game][1],
                         processor,
                         embedding_model,
                         torch,
@@ -422,20 +526,20 @@ def main() -> None:
                         args.top_k,
                     )
                     if matches:
-                        frozen_matches.append((polygon, matches[0]))
+                        frozen_matches.append((polygon, matches[0], game))
                     for rank, (score, rotated, details) in enumerate(matches, start=1):
                         _, name, set_code, collector_number, usd, eur = details
                         orientation = "rotated" if rotated else "upright"
                         print(
                             f"  {rank}. {name} | {set_code.upper()} #{collector_number} "
-                            f"| {format_prices(usd, eur)} | {score:.3f} | {orientation}"
+                            f"| {format_prices(usd, eur, game)} | {score:.3f} | {orientation}"
                         )
-                print(f"Captured {len(detections)} cards for retrieval")
+                print(f"Captured {len(frozen_matches)} cards for retrieval")
                 if args.captures_dir is not None:
                     print(
                         f"Saved {saved}/{len(detections)} crops in {args.captures_dir}"
                     )
-                for polygon, match in frozen_matches:
+                for polygon, match, game in frozen_matches:
                     points = np.round(polygon).astype(np.int32).reshape((-1, 1, 2))
                     cv2.polylines(
                         frozen_frame,
@@ -444,7 +548,7 @@ def main() -> None:
                         color=(0, 230, 70),
                         thickness=3,
                     )
-                    draw_capture_metadata(frozen_frame, polygon, match)
+                    draw_capture_metadata(frozen_frame, polygon, match, game)
                 cv2.putText(
                     frozen_frame,
                     "Captured - c or r: resume | q: quit",

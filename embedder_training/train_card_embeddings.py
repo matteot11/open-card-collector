@@ -14,6 +14,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
 DEFAULT_DATA_DIR = Path("data/scryfall_source")
+DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
 DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 
@@ -21,14 +22,21 @@ def import_runtime():
     """Load optional training dependencies only when training starts."""
     try:
         import torch
-        from torch.utils.data import DataLoader, Dataset
+        from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
         from transformers import AutoImageProcessor, AutoModel
     except ImportError as error:
         raise SystemExit(
             "Missing embedder dependencies. Install them with:\n"
             "uv sync --extra embedder-training"
         ) from error
-    return torch, Dataset, DataLoader, AutoImageProcessor, AutoModel
+    return (
+        torch,
+        Dataset,
+        DataLoader,
+        WeightedRandomSampler,
+        AutoImageProcessor,
+        AutoModel,
+    )
 
 
 def select_device(torch, requested_device: str) -> str:
@@ -42,13 +50,16 @@ def select_device(torch, requested_device: str) -> str:
     return "cpu"
 
 
-def load_image_paths(database_path: Path) -> list[Path]:
-    """Load every valid cached catalog image path from SQLite."""
+def load_image_paths(database_path: Path, game: str) -> list[Path]:
+    """Load cached reference image paths from the selected game's catalog."""
+    if game not in {"mtg", "pokemon"}:
+        raise ValueError(f"Unsupported game: {game}")
     if not database_path.is_file():
         raise FileNotFoundError(f"Catalog database does not exist: {database_path}")
+    table = "cards" if game == "mtg" else "pokemon_cards"
     with sqlite3.connect(database_path) as connection:
         rows = connection.execute(
-            "SELECT image_path FROM cards WHERE image_path IS NOT NULL"
+            f"SELECT image_path FROM {table} WHERE image_path IS NOT NULL"
         ).fetchall()
     return [Path(row[0]) for row in rows if Path(row[0]).is_file()]
 
@@ -117,9 +128,13 @@ def collate_card_views(processor, batch):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fine-tune DINOv3 Small with paired synthetic card captures."
+        description="Fine-tune DINOv3 with paired MTG and/or Pokemon card views."
     )
+    parser.add_argument("--game", choices=("mtg", "pokemon", "both"), default="mtg")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--pokemon-data-dir", type=Path, default=DEFAULT_POKEMON_DATA_DIR
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--output-dir",
@@ -144,23 +159,77 @@ def main() -> None:
             "--epochs, --learning-rate, and --temperature must be positive; --batch-size must be at least 2"
         )
 
-    torch, Dataset, DataLoader, AutoImageProcessor, AutoModel = import_runtime()
+    (
+        torch,
+        Dataset,
+        DataLoader,
+        WeightedRandomSampler,
+        AutoImageProcessor,
+        AutoModel,
+    ) = import_runtime()
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = select_device(torch, args.device)
-    image_paths = load_image_paths(args.data_dir / "catalog.sqlite")
+    image_paths_by_game = {}
+    if args.game in ("mtg", "both"):
+        image_paths_by_game["mtg"] = load_image_paths(
+            args.data_dir / "catalog.sqlite", "mtg"
+        )
+    if args.game in ("pokemon", "both"):
+        image_paths_by_game["pokemon"] = load_image_paths(
+            args.pokemon_data_dir / "catalog.sqlite", "pokemon"
+        )
+    if args.game == "both" and any(
+        not paths for paths in image_paths_by_game.values()
+    ):
+        raise RuntimeError(
+            "Joint training needs cached reference images for both MTG and Pokemon"
+        )
+    image_paths = [
+        image_path
+        for game_paths in image_paths_by_game.values()
+        for image_path in game_paths
+    ]
     if len(image_paths) < args.batch_size:
         raise RuntimeError(
             "Not enough cached catalog images for the requested batch size"
         )
 
     processor = AutoImageProcessor.from_pretrained(args.model)
+    if args.game == "both":
+        balanced_sample_count = (
+            2
+            * min(
+                len(image_paths_by_game["mtg"]),
+                len(image_paths_by_game["pokemon"]),
+            )
+            // args.batch_size
+            * args.batch_size
+        )
+        if balanced_sample_count < args.batch_size:
+            raise RuntimeError(
+                "Joint training needs at least half a batch of cached images for each game"
+            )
+        sample_weights = [
+            1.0 / len(image_paths_by_game[game])
+            for game in ("mtg", "pokemon")
+            for _ in image_paths_by_game[game]
+        ]
+        sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=balanced_sample_count,
+            replacement=False,
+        )
+    else:
+        sampler = None
 
     loader = DataLoader(
         CardDataset(image_paths),
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
+        drop_last=args.game == "both",
         num_workers=args.workers,
         collate_fn=partial(collate_card_views, processor),
         pin_memory=device == "cuda",
