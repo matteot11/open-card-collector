@@ -160,7 +160,8 @@ def load_catalog_embeddings(
     if not rows:
         raise RuntimeError(
             f"No {game} reference embeddings match this model name. Run "
-            "data_preparation/embedder/01.embed_scryfall_images.py with the same model name."
+            "data_preparation/embedder/01.build_reference_embeddings.py "
+            "with the same model name."
         )
     vectors = np.vstack([np.frombuffer(row[0], dtype=np.float32) for row in rows])
     details: list[CardDetails] = [

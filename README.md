@@ -22,6 +22,21 @@ Follow **steps 1–4 to use the camera with the published models**. You do not n
 - [7. Train the embedder (optional)](#7-train-the-embedder-optional)
 - [8. Use and test your own models (optional)](#8-use-and-test-your-own-models-optional)
 
+## Project Layout
+
+Catalog synchronization is grouped by game, while workflows that apply to both games use shared scripts:
+
+| Area | Purpose |
+| ---- | ------- |
+| `data_preparation/catalogs/mtg/` | Scryfall catalog synchronization |
+| `data_preparation/catalogs/pokemon/` | TCGdex catalog synchronization |
+| `data_preparation/detector/` | Game-specific template downloads and shared scene generation |
+| `data_preparation/embedder/` | Shared MTG/Pokemon reference embedding builder |
+| `detector_training/`, `embedder_training/` | Shared detector and embedder trainers |
+| `pipeline/` | Camera inference and per-game catalog routing |
+
+The existing `data/scryfall_source/` directory is retained as the MTG data default so existing catalogs and embeddings remain usable.
+
 ## 1. Install
 
 You need Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a desktop with a camera.
@@ -47,7 +62,7 @@ Choose the build using the [PyTorch installation selector](https://pytorch.org/g
 The catalog contains card names, printing details, prices, and image URLs from Scryfall. The reference images are the scans against which camera captures will be matched.
 
 ```bash
-uv run python data_preparation/00.sync_scryfall_catalog.py --download-images
+uv run python data_preparation/catalogs/mtg/00.sync_catalog.py --download-images
 ```
 
 This downloads Scryfall's Default Cards export, imports it into SQLite, and downloads JPEG reference images. The full bulk export, catalog, and reference image cache together use about 20 GB of disk space, growing as Scryfall adds cards. To try a smaller subset, add `--image-limit 10000`: this run will attempt up to 10,000 missing or changed images. Running again skips successful downloads and continues with the remaining images. Leave the limit out to download all remaining images.
@@ -71,7 +86,7 @@ The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `c
 Pokemon data comes from the [TCGdex REST API](https://tcgdex.dev/rest). Each run adds up to 1,000 card details and prices to a separate local catalog. Repeat the command to continue through the catalog; use `--refresh` to refresh existing details and prices. `--download-images` caches high-quality JPEG references for the embedder. PNG detector templates are downloaded separately in step 5.1.
 
 ```bash
-uv run python data_preparation/pokemon/00.sync_tcgdex_catalog.py --download-images
+uv run python data_preparation/catalogs/pokemon/00.sync_catalog.py --download-images
 ```
 
 | Location | Contents |
@@ -88,7 +103,7 @@ This repository distributes downloader code, not downloaded pricing databases. T
 An embedding is a numerical representation of an image. This command turns the downloaded reference images into vectors that can be searched quickly:
 
 ```bash
-uv run python data_preparation/embedder/01.embed_scryfall_images.py --device auto
+uv run python data_preparation/embedder/01.build_reference_embeddings.py --device auto
 ```
 
 Vectors are stored in `catalog.sqlite`. **Only cards with reference embeddings can be retrieved.** Downloading model weights or catalog metadata alone is not enough. Images are needed to create or refresh embeddings, but not to search vectors already stored in the database.
@@ -105,7 +120,7 @@ Rerunning skips unchanged images already embedded with the same model name. If y
 For Pokemon, build vectors using the same selected model name that you will use for inference:
 
 ```bash
-uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+uv run python data_preparation/embedder/01.build_reference_embeddings.py \
 	--game pokemon \
 	--model facebook/dinov3-vits16-pretrain-lvd1689m
 ```
@@ -113,10 +128,10 @@ uv run python data_preparation/embedder/01.embed_scryfall_images.py \
 To test one shared embedder for both games, use the same `--model` value for both catalogs. Each catalog keeps its own model-keyed vector table:
 
 ```bash
-uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+uv run python data_preparation/embedder/01.build_reference_embeddings.py \
 	--game mtg \
 	--model runs/embedder_training/dinov3-mtg-pokemon
-uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+uv run python data_preparation/embedder/01.build_reference_embeddings.py \
 	--game pokemon \
 	--model runs/embedder_training/dinov3-mtg-pokemon
 ```
@@ -189,7 +204,7 @@ The detector learns card geometry, not card names or printings. Its training ima
 You need the catalog from step 2, but JPEG downloads and reference embeddings are not required if you are only training the detector. For metadata alone, run step 2's command without `--download-images`.
 
 ```bash
-uv run python data_preparation/detector/00.download_scryfall_png.py --limit 2000
+uv run python data_preparation/detector/00.download_mtg_templates.py --limit 2000
 ```
 
 This tries to download up to 2,000 missing or invalid PNGs. Already downloaded valid PNGs are skipped and do not count toward the limit; failed attempts do count. Run again to continue downloading, or remove `--limit 2000` to try every remaining PNG.
@@ -201,7 +216,7 @@ The downloader reads `image_uris.png`, validates files, and saves original bytes
 Pokemon detector templates are downloaded separately from the synced catalog, mirroring the MTG workflow:
 
 ```bash
-uv run python data_preparation/detector/00.download_tcgdex_png.py --limit 1000
+uv run python data_preparation/detector/00.download_pokemon_templates.py --limit 1000
 ```
 
 `--limit 1000` bounds each run to 1,000 missing templates, so rerunning resumes with the next batch and eventually reports `Pokemon PNG templates downloaded: 0`. Omit `--limit` to attempt every remaining template in one run. Files are stored under `data/detector_training_data/pokemon_png`. TCGdex PNG alpha is preserved; for legacy scans whose PNG has an opaque background, this detector downloader adds an antialiased rounded-corner alpha mask while retaining the visible card border. Embedder references remain separate JPEG files in `data/pokemon_source/images/`. For a Pokemon-only dataset, use `--game pokemon --images-dir data/detector_training_data/pokemon_png`; train it with `--class-names pokemon` and run the camera with `--game pokemon`.
@@ -373,13 +388,13 @@ Changing only the detector does not require new reference embeddings.
 First build reference vectors with your trained embedder, then use the same directory for camera queries:
 
 ```bash
-uv run python data_preparation/embedder/01.embed_scryfall_images.py \
+uv run python data_preparation/embedder/01.build_reference_embeddings.py \
 	--model runs/embedder_training/dinov3-card-small
 uv run python pipeline/capture_camera.py \
 	--embedding-model runs/embedder_training/dinov3-card-small
 ```
 
-`--model` in [01.embed_scryfall_images.py](data_preparation/embedder/01.embed_scryfall_images.py) and `--embedding-model` in [capture_camera.py](pipeline/capture_camera.py) must identify the same embedder, because reference and camera vectors must come from the same model. MTG defaults to the published MTG embedder; Pokemon and mixed mode default to the DINOv3 base checkpoint, which is not fine-tuned for either game.
+`--model` in [01.build_reference_embeddings.py](data_preparation/embedder/01.build_reference_embeddings.py) and `--embedding-model` in [capture_camera.py](pipeline/capture_camera.py) must identify the same embedder, because reference and camera vectors must come from the same model. MTG defaults to the published MTG embedder; Pokemon and mixed mode default to the DINOv3 base checkpoint, which is not fine-tuned for either game.
 
 Cache reuse checks image content and the model name or directory string, not model weights. If you train new weights, save them under a new directory and use it in both commands. Otherwise unchanged references could reuse vectors from the old weights. Existing vectors remain usable with the model that created them.
 

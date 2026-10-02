@@ -1,4 +1,4 @@
-"""Download transparent TCGdex PNG templates separately from embedding images."""
+"""Download transparent Pokemon PNG templates separately from reference images."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def download_templates(
     if not database_path.is_file():
         raise FileNotFoundError(
             f"Pokemon catalog not found: {database_path}. "
-            "Run data_preparation/pokemon/00.sync_tcgdex_catalog.py first."
+            "Run data_preparation/catalogs/pokemon/00.sync_catalog.py first."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(

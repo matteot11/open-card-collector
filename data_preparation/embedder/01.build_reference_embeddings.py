@@ -1,4 +1,4 @@
-"""Embed cached MTG or Pokemon reference images for local card-similarity search."""
+"""Build MTG or Pokemon reference embeddings in the selected card catalog."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 from rich.progress import track
 
-DEFAULT_DATA_DIR = Path("data/scryfall_source")
+DEFAULT_MTG_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
 DEFAULT_MTG_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
 DEFAULT_POKEMON_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
@@ -212,7 +212,7 @@ def main() -> None:
         parser.error("--batch-size and --limit must be greater than zero")
 
     default_data_dir = (
-        DEFAULT_DATA_DIR if args.game == "mtg" else DEFAULT_POKEMON_DATA_DIR
+        DEFAULT_MTG_DATA_DIR if args.game == "mtg" else DEFAULT_POKEMON_DATA_DIR
     )
     data_dir = args.data_dir or default_data_dir
     model_name = args.model or (
