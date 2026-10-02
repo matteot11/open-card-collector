@@ -334,14 +334,12 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        default=1000,
-        help="Maximum card details to fetch per run; repeat to continue (default: 1000).",
+        help="Maximum card details to fetch per run; omit to fetch every remaining card.",
     )
     parser.add_argument(
         "--image-limit",
         type=int,
-        default=1000,
-        help="Maximum missing images to download per run (default: 1000).",
+        help="Maximum missing images to download per run; omit to download every remaining image.",
     )
     parser.add_argument(
         "--refresh",
@@ -349,7 +347,9 @@ def main() -> None:
         help="Refetch existing card details and update cached metadata and prices.",
     )
     args = parser.parse_args()
-    if args.limit <= 0 or args.image_limit <= 0:
+    if (args.limit is not None and args.limit <= 0) or (
+        args.image_limit is not None and args.image_limit <= 0
+    ):
         parser.error("--limit and --image-limit must be greater than zero")
     _, _, failed = sync_catalog(
         args.data_dir,

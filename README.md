@@ -83,7 +83,7 @@ The database keeps two URLs: `image_url` is the latest URL from Scryfall, and `c
 
 ### Pokemon Catalog (Optional)
 
-Pokemon data comes from the [TCGdex REST API](https://tcgdex.dev/rest). Each run adds up to 1,000 card details and prices to a separate local catalog. Repeat the command to continue through the catalog; use `--refresh` to refresh existing details and prices. `--download-images` caches high-quality JPEG references for the embedder. PNG detector templates are downloaded separately in step 5.1.
+Pokemon data comes from the [TCGdex REST API](https://tcgdex.dev/rest). By default, each run fetches every remaining card detail and price into a separate local catalog; use `--limit N` to fetch fewer cards. Use `--refresh` to refresh existing details and prices. `--download-images` caches high-quality JPEG references for the embedder, attempting every remaining image by default; use `--image-limit N` to bound downloads. PNG detector templates are downloaded separately in step 5.1.
 
 ```bash
 uv run python data_preparation/catalogs/pokemon/00.sync_catalog.py --download-images
