@@ -1,4 +1,4 @@
-"""Download original Scryfall PNG detector templates without altering their alpha."""
+"""Download original MTG PNG detector templates without altering their alpha."""
 
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ def download_templates(
         raise ValueError("limit must be greater than zero")
     if not database_path.is_file():
         raise FileNotFoundError(
-            f"Catalog not found: {database_path}. Run 00.sync_scryfall_catalog.py first."
+            f"Catalog not found: {database_path}. "
+            "Run data_preparation/catalogs/mtg/00.sync_catalog.py first."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(

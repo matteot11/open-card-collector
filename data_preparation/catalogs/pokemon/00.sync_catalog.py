@@ -1,4 +1,4 @@
-"""Sync Pokemon card metadata and optional images from the TCGdex REST API."""
+"""Synchronize the TCGdex catalog and optional Pokemon reference images."""
 
 from __future__ import annotations
 

@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
-DEFAULT_DATA_DIR = Path("data/scryfall_source")
+DEFAULT_MTG_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
 DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
@@ -131,7 +131,7 @@ def main() -> None:
         description="Fine-tune DINOv3 with paired MTG and/or Pokemon card views."
     )
     parser.add_argument("--game", choices=("mtg", "pokemon", "both"), default="mtg")
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_MTG_DATA_DIR)
     parser.add_argument(
         "--pokemon-data-dir", type=Path, default=DEFAULT_POKEMON_DATA_DIR
     )
