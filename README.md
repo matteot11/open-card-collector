@@ -35,8 +35,6 @@ Catalog synchronization is grouped by game, while workflows that apply to both g
 | `detector_training/`, `embedder_training/` | Shared detector and embedder trainers |
 | `pipeline/` | Camera inference and per-game catalog routing |
 
-The existing `data/scryfall_source/` directory is retained as the MTG data default so existing catalogs and embeddings remain usable.
-
 ## 1. Install
 
 You need Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a desktop with a camera.
