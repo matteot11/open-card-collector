@@ -302,7 +302,7 @@ uv run python detector_training/train_yolo_obb.py \
 	--name mtg_mobile_v3_yolo11n_obb
 ```
 
-The example uses 10 epochs, 640px input, and batch 8 to reduce memory use. Script defaults are 60 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
+The example uses 10 epochs, 640px input, and batch 8 to reduce memory use. Script defaults are 10 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
 
 Train a two-class model on the mixed dataset from the previous section with:
 
