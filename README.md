@@ -294,15 +294,15 @@ Use the dataset created in step 5:
 ```bash
 uv run python detector_training/train_yolo_obb.py \
 	--dataset-dir data/detector_training_data/synthetic/mtg_mobile_v3 \
-	--epochs 60 \
-	--imgsz 896 \
+	--epochs 10 \
+	--imgsz 640 \
 	--batch 8 \
 	--device auto \
 	--output-dir runs/obb \
 	--name mtg_mobile_v3_yolo11n_obb
 ```
 
-The example uses 896px input for extra detail and batch 8 to reduce memory use. Script defaults are 60 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
+The example uses 10 epochs, 640px input, and batch 8 to reduce memory use. Script defaults are 60 epochs, 640px, batch 16, four workers, and seed 42. Lower the batch if memory is insufficient. For CUDA automatic batch sizing, use `--device 0 --batch -1`.
 
 Train a two-class model on the mixed dataset from the previous section with:
 
@@ -310,8 +310,8 @@ Train a two-class model on the mixed dataset from the previous section with:
 uv run python detector_training/train_yolo_obb.py \
 	--dataset-dir data/detector_training_data/synthetic/mtg_pokemon_v1 \
 	--class-names mtg,pokemon \
-	--epochs 60 \
-	--imgsz 896 \
+	--epochs 10 \
+	--imgsz 640 \
 	--batch 8 \
 	--device auto \
 	--output-dir runs/obb \
