@@ -1,4 +1,4 @@
-"""Synchronize Scryfall's Default Cards bulk export into a local card catalog."""
+"""Synchronize the Scryfall catalog and optional MTG reference images."""
 
 from __future__ import annotations
 

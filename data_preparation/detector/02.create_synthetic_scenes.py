@@ -18,21 +18,27 @@ import cv2
 import numpy as np
 from rich.progress import track
 
-CARD_CLASS_ID = 0
+GAME_CLASS_IDS = {"mtg": 0, "pokemon": 1}
 BACKGROUND_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-def load_templates(images_dir: Path) -> list[dict[str, str]]:
+def load_templates(
+    images_dir: Path, game: str, class_id: int | None = None
+) -> list[dict[str, Any]]:
     """Load local card templates, preferably original PNGs with transparency."""
     if not images_dir.is_dir():
         raise FileNotFoundError(
             f"Template images directory does not exist: {images_dir}"
         )
+    if game not in GAME_CLASS_IDS:
+        raise ValueError(f"Unsupported template game: {game}")
     templates = [
         {
-            "scryfall_id": path.stem,
+            "card_id": path.stem,
             "filename": path.name,
             "template_path": str(path),
+            "game": game,
+            "class_id": GAME_CLASS_IDS[game] if class_id is None else class_id,
         }
         for path in sorted(images_dir.iterdir())
         if path.is_file() and path.suffix.lower() in BACKGROUND_EXTENSIONS
@@ -430,13 +436,15 @@ def composite_card(
     ).astype(np.uint8)
 
 
-def yolo_obb_line(quad: np.ndarray, canvas_width: int, canvas_height: int) -> str:
+def yolo_obb_line(
+    quad: np.ndarray, canvas_width: int, canvas_height: int, class_id: int
+) -> str:
     """Serialize [top-left, top-right, bottom-right, bottom-left] as a YOLO-OBB label."""
     normalized = np.clip(quad / np.array([canvas_width, canvas_height]), 0.0, 1.0)
     values = " ".join(
         f"{coordinate:.6f}" for point in normalized for coordinate in point
     )
-    return f"{CARD_CLASS_ID} {values}"
+    return f"{class_id} {values}"
 
 
 def placement_regions(
@@ -553,7 +561,29 @@ def create_scene(
     if layout == "binder":
         rotation_probability = 0.0
         local_rotation_limit = min(5.0, upright_rotation_degrees)
-    selected_templates = randomizer.sample(templates, k=cards_per_scene)
+    templates_by_class: dict[int, list[dict[str, Any]]] = {}
+    for template in templates:
+        templates_by_class.setdefault(template["class_id"], []).append(template)
+    class_ids = sorted(templates_by_class)
+    if len(class_ids) == 1:
+        selected_templates = randomizer.sample(templates, k=cards_per_scene)
+    else:
+        class_counts = dict.fromkeys(class_ids, 0)
+        class_sequence = []
+        for _ in range(cards_per_scene):
+            least_used = min(class_counts.values())
+            eligible_classes = [
+                class_id
+                for class_id, count in class_counts.items()
+                if count == least_used
+            ]
+            selected_class = randomizer.choice(eligible_classes)
+            class_sequence.append(selected_class)
+            class_counts[selected_class] += 1
+        selected_templates = [
+            randomizer.choice(templates_by_class[class_id])
+            for class_id in class_sequence
+        ]
     scene_cards: list[dict[str, Any]] = []
     regions = placement_regions(
         canvas_width, canvas_height, cards_per_scene, randomizer, layout=layout
@@ -609,8 +639,13 @@ def create_scene(
             scene_cards[index]["occluded_by_card_indices"].append(len(scene_cards))
         scene_cards.append(
             {
-                "template_scryfall_id": template["scryfall_id"],
+                "template_card_id": template["card_id"],
+                "template_scryfall_id": (
+                    template["card_id"] if template["game"] == "mtg" else None
+                ),
                 "template_filename": template["filename"],
+                "game": template["game"],
+                "class_id": template["class_id"],
                 "rotation_degrees": round(angle_degrees, 3),
                 "layout": layout,
                 "sleeved": sleeved,
@@ -626,7 +661,7 @@ def create_scene(
 
 
 def create_dataset(
-    images_dir: Path,
+    mtg_images_dir: Path,
     backgrounds_dir: Path,
     output_dir: Path,
     image_count: int,
@@ -641,6 +676,8 @@ def create_dataset(
     camera_view_probability: float = 0.75,
     sleeve_probability: float = 0.5,
     empty_scene_probability: float = 0.05,
+    game: str = "mtg",
+    pokemon_imgs_dir: Path | None = None,
 ) -> None:
     """Create image, label, and scene-provenance files for a synthetic OBB dataset."""
     if min_cards <= 0 or max_cards < min_cards:
@@ -673,9 +710,53 @@ def create_dataset(
             f"Output directory must be empty; choose a fresh path: {output_dir}"
         )
 
-    templates = load_templates(images_dir)
+    if game not in {"mtg", "pokemon", "both"}:
+        raise ValueError("game must be mtg, pokemon, or both")
+    templates = []
+    if game in {"mtg", "both"}:
+        templates.extend(load_templates(mtg_images_dir, "mtg"))
+    if game in {"pokemon", "both"}:
+        if pokemon_imgs_dir is None:
+            raise ValueError("pokemon_imgs_dir is required for Pokemon templates")
+        templates.extend(
+            load_templates(
+                pokemon_imgs_dir,
+                "pokemon",
+                class_id=0 if game == "pokemon" else None,
+            )
+        )
     if max_cards > len(templates):
         raise ValueError("max_cards cannot exceed the number of available templates")
+    templates_by_class: dict[int, list[dict[str, Any]]] = {}
+    for template in templates:
+        templates_by_class.setdefault(template["class_id"], []).append(template)
+    if game == "both" and any(
+        len(class_templates) < max_cards
+        for class_templates in templates_by_class.values()
+    ):
+        raise ValueError(
+            "max_cards cannot exceed the number of templates for either game "
+            "when generating mixed-game scenes"
+        )
+    scene_templates_by_game = {
+            "mtg": (
+                templates
+                if game == "mtg"
+                else templates_by_class.get(GAME_CLASS_IDS["mtg"], [])
+            ),
+            "pokemon": (
+                templates
+                if game == "pokemon"
+                else templates_by_class.get(GAME_CLASS_IDS["pokemon"], [])
+            ),
+            "both": templates,
+        }
+    if game == "both":
+        scene_games = ["mtg", "pokemon", "both"] * ((image_count + 2) // 3)
+        random.Random(f"{seed}:scene-games").shuffle(scene_games)
+        scene_games = scene_games[:image_count]
+    else:
+        scene_games = [game] * image_count
 
     background_paths = load_background_paths(backgrounds_dir)
 
@@ -696,7 +777,7 @@ def create_dataset(
                 cards_per_scene = randomizer.randint(min_cards, max_cards)
             canvas_width, canvas_height = randomizer.choice(canvas_dimensions)
             image, scene_cards, background_source = create_scene(
-                templates,
+                scene_templates_by_game[scene_games[index]],
                 background_paths,
                 canvas_width,
                 canvas_height,
@@ -720,7 +801,13 @@ def create_dataset(
                 for card in scene_cards:
                     quad = np.array(card["quadrilateral_pixels"], dtype=np.float32)
                     labels.write(
-                        yolo_obb_line(quad, canvas_width, canvas_height) + "\n"
+                        yolo_obb_line(
+                            quad,
+                            canvas_width,
+                            canvas_height,
+                            card["class_id"],
+                        )
+                        + "\n"
                     )
 
             manifest.write(
@@ -728,6 +815,7 @@ def create_dataset(
                     {
                         "scene": stem,
                         "seed": seed,
+                        "game_composition": scene_games[index],
                         "canvas_width": canvas_width,
                         "canvas_height": canvas_height,
                         "aspect_ratio": round(canvas_width / canvas_height, 6),
@@ -785,13 +873,29 @@ def parse_canvas_dimensions(value: str) -> list[tuple[int, int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create a geometric synthetic MTG YOLO-OBB dataset."
+        description="Create synthetic MTG, Pokemon, or mixed-game YOLO-OBB scenes."
     )
     parser.add_argument(
+        "--mtg-images-dir",
         "--images-dir",
+        dest="mtg_images_dir",
         type=Path,
         default=Path("data/detector_training_data/scryfall_png"),
-        help="Original Scryfall PNG templates; alpha preserves rounded corners.",
+        help="MTG card templates; alpha preserves rounded corners when available.",
+    )
+    parser.add_argument(
+        "--game",
+        choices=("mtg", "pokemon", "both"),
+        default="mtg",
+        help="Template game; both assigns balanced two-class labels.",
+    )
+    parser.add_argument(
+        "--pokemon-imgs-dir",
+        "--pokemon-images-dir",
+        dest="pokemon_imgs_dir",
+        type=Path,
+        default=Path("data/detector_training_data/pokemon_png"),
+        help="Pokemon PNG templates, used when --game pokemon or both.",
     )
     parser.add_argument(
         "--backgrounds-dir",
@@ -861,7 +965,7 @@ def main() -> None:
         parser.error("--count and --canvas-size must be greater than zero")
 
     create_dataset(
-        images_dir=args.images_dir,
+        mtg_images_dir=args.mtg_images_dir,
         backgrounds_dir=args.backgrounds_dir,
         output_dir=args.output_dir,
         image_count=args.count,
@@ -884,6 +988,8 @@ def main() -> None:
         camera_view_probability=args.camera_view_probability,
         sleeve_probability=args.sleeve_probability,
         empty_scene_probability=args.empty_scene_probability,
+        game=args.game,
+        pokemon_imgs_dir=args.pokemon_imgs_dir,
     )
 
 
