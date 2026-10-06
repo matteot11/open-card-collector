@@ -661,7 +661,7 @@ def create_scene(
 
 
 def create_dataset(
-    images_dir: Path,
+    mtg_images_dir: Path,
     backgrounds_dir: Path,
     output_dir: Path,
     image_count: int,
@@ -677,7 +677,7 @@ def create_dataset(
     sleeve_probability: float = 0.5,
     empty_scene_probability: float = 0.05,
     game: str = "mtg",
-    pokemon_images_dir: Path | None = None,
+    pokemon_imgs_dir: Path | None = None,
 ) -> None:
     """Create image, label, and scene-provenance files for a synthetic OBB dataset."""
     if min_cards <= 0 or max_cards < min_cards:
@@ -712,17 +712,51 @@ def create_dataset(
 
     if game not in {"mtg", "pokemon", "both"}:
         raise ValueError("game must be mtg, pokemon, or both")
-    templates = (
-        load_templates(images_dir, "pokemon", class_id=0)
-        if game == "pokemon"
-        else load_templates(images_dir, "mtg")
-    )
-    if game == "both":
-        if pokemon_images_dir is None:
-            raise ValueError("pokemon_images_dir is required when game is both")
-        templates.extend(load_templates(pokemon_images_dir, "pokemon"))
+    templates = []
+    if game in {"mtg", "both"}:
+        templates.extend(load_templates(mtg_images_dir, "mtg"))
+    if game in {"pokemon", "both"}:
+        if pokemon_imgs_dir is None:
+            raise ValueError("pokemon_imgs_dir is required for Pokemon templates")
+        templates.extend(
+            load_templates(
+                pokemon_imgs_dir,
+                "pokemon",
+                class_id=0 if game == "pokemon" else None,
+            )
+        )
     if max_cards > len(templates):
         raise ValueError("max_cards cannot exceed the number of available templates")
+    templates_by_class: dict[int, list[dict[str, Any]]] = {}
+    for template in templates:
+        templates_by_class.setdefault(template["class_id"], []).append(template)
+    if game == "both" and any(
+        len(class_templates) < max_cards
+        for class_templates in templates_by_class.values()
+    ):
+        raise ValueError(
+            "max_cards cannot exceed the number of templates for either game "
+            "when generating mixed-game scenes"
+        )
+    scene_templates_by_game = {
+            "mtg": (
+                templates
+                if game == "mtg"
+                else templates_by_class.get(GAME_CLASS_IDS["mtg"], [])
+            ),
+            "pokemon": (
+                templates
+                if game == "pokemon"
+                else templates_by_class.get(GAME_CLASS_IDS["pokemon"], [])
+            ),
+            "both": templates,
+        }
+    if game == "both":
+        scene_games = ["mtg", "pokemon", "both"] * ((image_count + 2) // 3)
+        random.Random(f"{seed}:scene-games").shuffle(scene_games)
+        scene_games = scene_games[:image_count]
+    else:
+        scene_games = [game] * image_count
 
     background_paths = load_background_paths(backgrounds_dir)
 
@@ -743,7 +777,7 @@ def create_dataset(
                 cards_per_scene = randomizer.randint(min_cards, max_cards)
             canvas_width, canvas_height = randomizer.choice(canvas_dimensions)
             image, scene_cards, background_source = create_scene(
-                templates,
+                scene_templates_by_game[scene_games[index]],
                 background_paths,
                 canvas_width,
                 canvas_height,
@@ -781,6 +815,7 @@ def create_dataset(
                     {
                         "scene": stem,
                         "seed": seed,
+                        "game_composition": scene_games[index],
                         "canvas_width": canvas_width,
                         "canvas_height": canvas_height,
                         "aspect_ratio": round(canvas_width / canvas_height, 6),
@@ -841,10 +876,12 @@ def main() -> None:
         description="Create synthetic MTG, Pokemon, or mixed-game YOLO-OBB scenes."
     )
     parser.add_argument(
+        "--mtg-images-dir",
         "--images-dir",
+        dest="mtg_images_dir",
         type=Path,
         default=Path("data/detector_training_data/scryfall_png"),
-        help="Primary game's card templates; alpha preserves rounded corners when available.",
+        help="MTG card templates; alpha preserves rounded corners when available.",
     )
     parser.add_argument(
         "--game",
@@ -853,10 +890,12 @@ def main() -> None:
         help="Template game; both assigns balanced two-class labels.",
     )
     parser.add_argument(
+        "--pokemon-imgs-dir",
         "--pokemon-images-dir",
+        dest="pokemon_imgs_dir",
         type=Path,
-        default=Path("data/pokemon_source/images"),
-        help="Pokemon image templates, used when --game both.",
+        default=Path("data/detector_training_data/pokemon_png"),
+        help="Pokemon PNG templates, used when --game pokemon or both.",
     )
     parser.add_argument(
         "--backgrounds-dir",
@@ -926,7 +965,7 @@ def main() -> None:
         parser.error("--count and --canvas-size must be greater than zero")
 
     create_dataset(
-        images_dir=args.images_dir,
+        mtg_images_dir=args.mtg_images_dir,
         backgrounds_dir=args.backgrounds_dir,
         output_dir=args.output_dir,
         image_count=args.count,
@@ -950,7 +989,7 @@ def main() -> None:
         sleeve_probability=args.sleeve_probability,
         empty_scene_probability=args.empty_scene_probability,
         game=args.game,
-        pokemon_images_dir=args.pokemon_images_dir,
+        pokemon_imgs_dir=args.pokemon_imgs_dir,
     )
 
 

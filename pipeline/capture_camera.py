@@ -15,10 +15,22 @@ CARD_WIDTH = 1371
 CARD_HEIGHT = 1920
 DEFAULT_RECOGNITION_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
-DEFAULT_MTG_EMBEDDING_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
-DEFAULT_SHARED_EMBEDDING_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
-DEFAULT_DETECTOR_MODEL = "matteot11/collector-mtg-detector-yolo11n-obb"
+DEFAULT_EMBEDDING_MODEL = "matteot11/collector-mtg-pkm-embedder-dinov3-small"
+DEFAULT_DETECTOR_MODEL = "matteot11/collector-mtg-pkm-detector-yolo11n-obb"
 CardDetails = tuple[str, str, str, str, str | None, str | None]
+CLASS_COLORS = (
+    (0, 230, 70),
+    (0, 165, 255),
+    (255, 100, 0),
+    (220, 0, 220),
+    (255, 255, 0),
+    (0, 220, 220),
+)
+
+
+def class_color(class_id: int) -> tuple[int, int, int]:
+    """Return a stable OpenCV BGR color for a detector class."""
+    return CLASS_COLORS[class_id % len(CLASS_COLORS)]
 
 
 def import_runtime():
@@ -118,9 +130,7 @@ def load_catalog_embeddings(
 
     connection = sqlite3.connect(database_path)
     try:
-        embeddings_table = (
-            "image_embeddings" if game == "mtg" else "pokemon_embeddings"
-        )
+        embeddings_table = "image_embeddings" if game == "mtg" else "pokemon_embeddings"
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
             (embeddings_table,),
@@ -229,6 +239,7 @@ def draw_capture_metadata(
     polygon: np.ndarray,
     match: tuple[float, bool, CardDetails],
     game: str,
+    color: tuple[int, int, int],
 ) -> None:
     """Draw a captured card's top retrieval result inside its detection box."""
     _, _, details = match
@@ -260,14 +271,18 @@ def draw_capture_metadata(
             (int(left) + 10, label_top + 17 + line_index * line_height),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 230, 70),
+            color,
             2,
             cv2.LINE_AA,
         )
 
 
 def draw_predictions(
-    frame: np.ndarray, result, confidence_threshold: float, class_names: dict[int, str]
+    frame: np.ndarray,
+    result,
+    confidence_threshold: float,
+    class_names: dict[int, str],
+    class_games: dict[int, str],
 ) -> list[tuple[np.ndarray, float, int]]:
     """Draw one oriented polygon and confidence tag for each predicted card."""
     if result.obb is None:
@@ -281,10 +296,11 @@ def draw_predictions(
     for polygon, confidence, class_id in zip(
         polygons, confidences, class_ids, strict=True
     ):
-        if confidence < confidence_threshold:
+        if confidence < confidence_threshold or class_id not in class_games:
             continue
         points = np.round(polygon).astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(frame, [points], isClosed=True, color=(0, 230, 70), thickness=3)
+        color = class_color(class_id)
+        cv2.polylines(frame, [points], isClosed=True, color=color, thickness=3)
         anchor_x, anchor_y = points[0, 0]
         label = f"{class_names.get(class_id, f'class {class_id}')} {confidence:.0%}"
         cv2.putText(
@@ -293,7 +309,7 @@ def draw_predictions(
             (int(anchor_x), max(24, int(anchor_y) - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (0, 230, 70),
+            color,
             2,
             cv2.LINE_AA,
         )
@@ -301,7 +317,7 @@ def draw_predictions(
     return detections
 
 
-def class_game_mapping(class_names: dict[int, str]) -> dict[int, str]:
+def class_game_mapping(class_names: dict[int, str], game: str) -> dict[int, str]:
     """Map trained YOLO class names to supported game names."""
     aliases = {
         "mtg": "mtg",
@@ -315,11 +331,18 @@ def class_game_mapping(class_names: dict[int, str]) -> dict[int, str]:
         for class_id, name in class_names.items()
         if name.strip().lower() in aliases
     }
-    if set(mapping.values()) != {"mtg", "pokemon"}:
+    if game == "both" and set(mapping.values()) != {"mtg", "pokemon"}:
         raise RuntimeError(
             "Mixed-game inference requires detector classes named mtg and pokemon "
             "(in either order). Train with --class-names mtg,pokemon."
         )
+    if game in {"mtg", "pokemon"}:
+        selected_mapping = {
+            class_id: detected_game
+            for class_id, detected_game in mapping.items()
+            if detected_game == game
+        }
+        return selected_mapping or {class_id: game for class_id in class_names}
     return mapping
 
 
@@ -327,7 +350,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Detect and retrieve cards from a camera, optionally saving crops."
     )
-    parser.add_argument("--game", choices=("mtg", "pokemon", "both"), default="mtg")
+    parser.add_argument("--game", choices=("mtg", "pokemon", "both"), default="both")
     parser.add_argument(
         "--model",
         default=None,
@@ -362,7 +385,11 @@ def main() -> None:
     parser.add_argument(
         "--embedding-model",
         default=None,
-        help="One shared model used to build/query embeddings for every selected game.",
+        help="Model name used to select reference embeddings from each catalog.",
+    )
+    parser.add_argument(
+        "--embedding-weights",
+        help="Hugging Face model ID or local trained model directory for capture embeddings.",
     )
     parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
@@ -378,11 +405,7 @@ def main() -> None:
 
     torch, YOLO = import_runtime()
     device = select_device(torch, args.device)
-    detector_model_name = args.model or (
-        DEFAULT_DETECTOR_MODEL if args.game == "mtg" else ""
-    )
-    if not detector_model_name:
-        parser.error("--model is required for Pokemon or mixed-game detection")
+    detector_model_name = args.model or DEFAULT_DETECTOR_MODEL
     try:
         detector_checkpoint = resolve_detector_checkpoint(detector_model_name)
     except FileNotFoundError as error:
@@ -396,16 +419,11 @@ def main() -> None:
             "uv sync --extra embedder-training"
         ) from error
     selected_games = ("mtg", "pokemon") if args.game == "both" else (args.game,)
-    embedding_model_name = args.embedding_model or (
-        DEFAULT_MTG_EMBEDDING_MODEL
-        if args.game == "mtg"
-        else DEFAULT_SHARED_EMBEDDING_MODEL
-    )
+    embedding_model_name = args.embedding_model or DEFAULT_EMBEDDING_MODEL
+    embedding_weights = args.embedding_weights or embedding_model_name
     catalogs = {}
     for game in selected_games:
-        data_dir = (
-            args.recognition_data_dir if game == "mtg" else args.pokemon_data_dir
-        )
+        data_dir = args.recognition_data_dir if game == "mtg" else args.pokemon_data_dir
         catalogs[game] = load_catalog_embeddings(
             data_dir / "catalog.sqlite", embedding_model_name, game
         )
@@ -413,24 +431,16 @@ def main() -> None:
             parser.error(
                 f"--top-k cannot exceed {len(catalogs[game][1])} {game} embeddings"
             )
-    processor = AutoProcessor.from_pretrained(embedding_model_name)
-    embedding_model = (
-        AutoModel.from_pretrained(embedding_model_name).to(device).eval()
-    )
+    processor = AutoProcessor.from_pretrained(embedding_weights)
+    embedding_model = AutoModel.from_pretrained(embedding_weights).to(device).eval()
     raw_class_names = model.names
     class_name_items = (
         raw_class_names.items()
         if isinstance(raw_class_names, dict)
         else enumerate(raw_class_names)
     )
-    class_names = {
-        int(class_id): str(name) for class_id, name in class_name_items
-    }
-    class_games = (
-        class_game_mapping(class_names)
-        if args.game == "both"
-        else {class_id: args.game for class_id in class_names}
-    )
+    class_names = {int(class_id): str(name) for class_id, name in class_name_items}
+    class_games = class_game_mapping(class_names, args.game)
     camera = cv2.VideoCapture(args.camera)
     if args.width is not None:
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -469,7 +479,7 @@ def main() -> None:
                 verbose=False,
             )[0]
             detections = draw_predictions(
-                frame, result, args.confidence, class_names
+                frame, result, args.confidence, class_names, class_games
             )
             now = time.perf_counter()
             fps = 1.0 / max(now - previous_time, 1e-6)
@@ -498,9 +508,7 @@ def main() -> None:
                 saved = 0
                 frozen_frame = capture_frame.copy()
                 frozen_matches = []
-                for index, (polygon, _, class_id) in enumerate(
-                    detections, start=1
-                ):
+                for index, (polygon, _, class_id) in enumerate(detections, start=1):
                     game = class_games.get(class_id)
                     if game is None or game not in catalogs:
                         print(f"Skipping unsupported detector class {class_id}")
@@ -527,7 +535,7 @@ def main() -> None:
                         args.top_k,
                     )
                     if matches:
-                        frozen_matches.append((polygon, matches[0], game))
+                        frozen_matches.append((polygon, matches[0], game, class_id))
                     for rank, (score, rotated, details) in enumerate(matches, start=1):
                         _, name, set_code, collector_number, usd, eur = details
                         orientation = "rotated" if rotated else "upright"
@@ -540,16 +548,17 @@ def main() -> None:
                     print(
                         f"Saved {saved}/{len(detections)} crops in {args.captures_dir}"
                     )
-                for polygon, match, game in frozen_matches:
+                for polygon, match, game, class_id in frozen_matches:
                     points = np.round(polygon).astype(np.int32).reshape((-1, 1, 2))
+                    color = class_color(class_id)
                     cv2.polylines(
                         frozen_frame,
                         [points],
                         isClosed=True,
-                        color=(0, 230, 70),
+                        color=color,
                         thickness=3,
                     )
-                    draw_capture_metadata(frozen_frame, polygon, match, game)
+                    draw_capture_metadata(frozen_frame, polygon, match, game, color)
                 cv2.putText(
                     frozen_frame,
                     "Captured - c or r: resume | q: quit",
