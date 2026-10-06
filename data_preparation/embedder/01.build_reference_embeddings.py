@@ -13,8 +13,8 @@ from rich.progress import track
 
 DEFAULT_MTG_DATA_DIR = Path("data/scryfall_source")
 DEFAULT_POKEMON_DATA_DIR = Path("data/pokemon_source")
-DEFAULT_MTG_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
-DEFAULT_POKEMON_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
+DEFAULT_MTG_MODEL = "matteot11/collector-mtg-pkm-embedder-dinov3-small"
+DEFAULT_POKEMON_MODEL = "matteot11/collector-mtg-pkm-embedder-dinov3-small"
 
 
 def import_runtime():
@@ -123,6 +123,7 @@ def pending_images(
 def build_embeddings(
     database_path: Path,
     model_name: str,
+    weights_name: str,
     device: str,
     batch_size: int,
     limit: int | None,
@@ -141,8 +142,8 @@ def build_embeddings(
         pending = pending_images(connection, model_name, limit, game)
         if not pending:
             return 0, 0
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name).to(device).eval()
+        processor = AutoProcessor.from_pretrained(weights_name)
+        model = AutoModel.from_pretrained(weights_name).to(device).eval()
         for start in track(
             range(0, len(pending), batch_size), description="Embedding images"
         ):
@@ -201,7 +202,14 @@ def main() -> None:
     )
     parser.add_argument("--game", choices=("mtg", "pokemon"), default="mtg")
     parser.add_argument("--data-dir", type=Path)
-    parser.add_argument("--model")
+    parser.add_argument(
+        "--model",
+        help="Embedding model name stored in the database (defaults per game).",
+    )
+    parser.add_argument(
+        "--weights",
+        help="Hugging Face model ID or local trained weights directory. Defaults to --model.",
+    )
     parser.add_argument("--device", default="auto", help="auto, mps, cpu, or cuda")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
@@ -218,11 +226,13 @@ def main() -> None:
     model_name = args.model or (
         DEFAULT_MTG_MODEL if args.game == "mtg" else DEFAULT_POKEMON_MODEL
     )
+    weights_name = args.weights or model_name
     torch, _, _ = import_runtime()
     device = select_device(torch, args.device)
     embedded, failed = build_embeddings(
         data_dir / "catalog.sqlite",
         model_name,
+        weights_name,
         device,
         args.batch_size,
         args.limit,

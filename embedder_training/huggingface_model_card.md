@@ -5,16 +5,17 @@ pipeline_tag: image-feature-extraction
 base_model: facebook/dinov3-vits16-pretrain-lvd1689m
 tags:
   - magic-the-gathering
+  - pokemon
   - trading-cards
   - image-retrieval
   - image-feature-extraction
   - dinov3
 ---
-# MTG Card Embedder - DINOv3 Small
+# MTG + Pokemon Card Embedder - DINOv3 Small
 
 Built with DINOv3.
 
-This model produces normalized visual embeddings for Magic: The Gathering card images. It is intended for nearest-neighbor retrieval against a separately created local card catalog; it does not directly classify or identify a card printing.
+This shared model produces visual embeddings for Magic: The Gathering and Pokemon card images. It is intended for nearest-neighbor retrieval against a separately created local card catalog for the corresponding game; it does not directly classify or identify a card printing.
 
 ## Model
 
@@ -26,9 +27,9 @@ This model produces normalized visual embeddings for Magic: The Gathering card i
 
 ## Training
 
-The base model was fine-tuned using paired synthetic camera views of cached Magic card images. Each view can include brightness, contrast, and color changes; small rotation; blur; and perspective distortion. Training optimizes symmetric InfoNCE loss between embeddings of two augmented views of the same card.
+The v2 model was fine-tuned from `facebook/dinov3-vits16-pretrain-lvd1689m` using paired augmented views of cached MTG and Pokemon reference images. Joint-training batches contain exactly 16 cards from each game (batch size 32); contrastive loss is calculated separately per game so cross-game examples are not used as retrieval negatives. Each view can include brightness, contrast, and color changes; small rotation; blur; and perspective distortion.
 
-The default training configuration uses 3 epochs, batch size 16, learning rate `1e-5`, temperature `0.07`, zero data-loader workers, and seed `42`. The complete training workflow is available in the [Open Card Collector](https://github.com/matteot11/open-card-collector) repository.
+Training configuration: 5 epochs, batch size 32, learning rate `1e-5`, temperature `0.07`, zero data-loader workers, seed `42`, and a per-game 10% validation split. The complete training workflow is available in the [Open Card Collector](https://github.com/matteot11/open-card-collector) repository.
 
 ## Usage
 
@@ -37,7 +38,7 @@ from PIL import Image
 import torch
 from transformers import AutoModel, AutoProcessor
 
-model_id = "matteot11/collector-mtg-embedder-dinov3-small"
+model_id = "matteot11/collector-mtg-pkm-embedder-dinov3-small"
 processor = AutoProcessor.from_pretrained(model_id)
 model = AutoModel.from_pretrained(model_id).eval()
 
@@ -50,10 +51,10 @@ with torch.inference_mode():
 
 ## Limitations
 
-The model was fine-tuned for Magic card retrieval, not general-purpose image recognition or authoritative card identification. Retrieval quality can degrade with glare, motion blur, occlusion, low resolution, heavy cropping, uncommon printings, or reference catalogs that do not contain the target card. The nearest retrieved catalog item should be reviewed by a user.
+The model was fine-tuned for MTG and Pokemon card retrieval, not general-purpose image recognition or authoritative card identification. Retrieval quality can degrade with glare, motion blur, occlusion, low resolution, heavy cropping, uncommon printings, or reference catalogs that do not contain the target card. The nearest retrieved catalog item should be reviewed by a user.
 
 ## License and Attribution
 
 This model is a derivative of DINOv3 and is distributed under the [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/). Use, modification, and redistribution must comply with those terms.
 
-The training workflow uses Magic card imagery obtained through Scryfall. Magic: The Gathering card names, artwork, and related intellectual property belong to Wizards of the Coast and their respective rights holders. This repository does not distribute training images, Scryfall catalog data, or derived catalog embeddings. Scryfall and Wizards of the Coast do not endorse this project.
+The training workflow uses Magic card imagery obtained through Scryfall and Pokemon card imagery obtained through TCGdex. Card names, artwork, and related intellectual property belong to their respective rights holders. This repository does not distribute training images, catalog data, or derived catalog embeddings. Scryfall, TCGdex, Wizards of the Coast, Nintendo, and The Pokemon Company do not endorse this project.

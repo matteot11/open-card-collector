@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import io
 import json
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 from PIL import Image
@@ -18,14 +20,55 @@ from rich.progress import track
 API_URL = "https://api.tcgdex.net/v2/en"
 USER_AGENT = "OpenCardCollector/0.1 (local Pokemon catalog builder)"
 DEFAULT_DATA_DIR = Path("data/pokemon_source")
+REQUEST_INTERVAL = 0.1
+_REQUEST_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
+_WORKER_LOCAL = threading.local()
+_WORKER_SESSIONS: list[requests.Session] = []
+_WORKER_SESSIONS_LOCK = threading.Lock()
+
+
+class ImageBudget:
+    def __init__(self, limit: int | None) -> None:
+        self.limit = limit
+        self.used = 0
+        self.lock = threading.Lock()
+
+    def claim(self) -> bool:
+        with self.lock:
+            if self.limit is not None and self.used >= self.limit:
+                return False
+            self.used += 1
+            return True
+
+
+def get_response(session: requests.Session, url: str) -> requests.Response:
+    """Pace request starts globally, including requests from worker threads."""
+    global _NEXT_REQUEST_AT
+    with _REQUEST_LOCK:
+        delay = _NEXT_REQUEST_AT - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        _NEXT_REQUEST_AT = time.monotonic() + REQUEST_INTERVAL
+    response = session.get(url, timeout=60)
+    response.raise_for_status()
+    return response
+
+
+def worker_session() -> requests.Session:
+    session = getattr(_WORKER_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        _WORKER_LOCAL.session = session
+        with _WORKER_SESSIONS_LOCK:
+            _WORKER_SESSIONS.append(session)
+    return session
 
 
 def request_json(session: requests.Session, url: str) -> Any:
     """Fetch one TCGdex JSON resource using a polite, bounded request cadence."""
-    response = session.get(url, timeout=60)
-    response.raise_for_status()
-    time.sleep(0.1)
-    return response.json()
+    return get_response(session, url).json()
 
 
 def initialize_database(connection: sqlite3.Connection) -> None:
@@ -92,8 +135,7 @@ def cache_image(
     image_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = image_path.with_suffix(".partial")
     try:
-        with session.get(f"{image_url}/high.jpg", timeout=60) as response:
-            response.raise_for_status()
+        with get_response(session, f"{image_url}/high.jpg") as response:
             content = response.content
         with Image.open(io.BytesIO(content)) as image:
             if image.format != "JPEG":
@@ -108,8 +150,69 @@ def cache_image(
     except (OSError, requests.RequestException, ValueError):
         temporary_path.unlink(missing_ok=True)
         raise
-    finally:
-        time.sleep(0.1)
+
+
+def fetch_card(
+    item: tuple[str, str, str, str | None, str | None],
+    images_dir: Path,
+    *,
+    download_images: bool,
+    image_budget: ImageBudget,
+) -> tuple[dict[str, Any], str | None, str | None, bool, str | None]:
+    _, _, card_id, previous_image_path, previous_cached_url = item
+    detail = request_json(worker_session(), f"{API_URL}/cards/{card_id}")
+    image_url = detail.get("image")
+    image_path = images_dir / f"{card_id}.jpg"
+    cached_image_url = previous_cached_url
+    stored_image_path = previous_image_path
+    downloaded = False
+    image_error = None
+    needs_image = (
+        download_images
+        and image_url
+        and (
+            not image_path.is_file()
+            or cached_image_url != image_url
+            or stored_image_path != str(image_path)
+        )
+    )
+    if needs_image and image_budget.claim():
+        try:
+            cache_image(worker_session(), image_url, image_path)
+            cached_image_url = image_url
+            stored_image_path = str(image_path)
+            downloaded = True
+        except (OSError, requests.RequestException, ValueError) as error:
+            image_error = str(error)
+    return detail, cached_image_url, stored_image_path, downloaded, image_error
+
+
+def iter_fetched_cards(
+    pending_ids: list[tuple[str, str, str, str | None, str | None]],
+    images_dir: Path,
+    *,
+    download_images: bool,
+    image_budget: ImageBudget,
+    workers: int,
+) -> Iterator[
+    tuple[
+        tuple[str, str, str, str | None, str | None],
+        Future[tuple[dict[str, Any], str | None, str | None, bool, str | None]],
+    ]
+]:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                fetch_card,
+                item,
+                images_dir,
+                download_images=download_images,
+                image_budget=image_budget,
+            ): item
+            for item in pending_ids
+        }
+        for future in as_completed(futures):
+            yield futures[future], future
 
 
 def sync_catalog(
@@ -119,23 +222,27 @@ def sync_catalog(
     limit: int | None,
     image_limit: int | None,
     refresh: bool,
+    workers: int,
 ) -> tuple[int, int, int]:
     """Append or refresh detailed cards and local Cardmarket/TCGplayer prices."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be greater than zero")
     if image_limit is not None and image_limit <= 0:
         raise ValueError("image_limit must be greater than zero")
+    if workers <= 0:
+        raise ValueError("workers must be greater than zero")
     data_dir.mkdir(parents=True, exist_ok=True)
     database_path = data_dir / "catalog.sqlite"
     images_dir = data_dir / "images"
     connection = sqlite3.connect(database_path)
     initialize_database(connection)
-    processed = downloaded = failed = image_attempts = 0
+    processed = downloaded = failed = 0
+    image_budget = ImageBudget(image_limit)
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     try:
         set_summaries = request_json(session, f"{API_URL}/sets")
-        pending_ids: list[tuple[str, str, str]] = []
+        pending_ids: list[tuple[str, str, str, str | None, str | None]] = []
         for set_summary in track(set_summaries, description="Listing Pokemon sets"):
             set_id = set_summary.get("id")
             if not set_id:
@@ -162,7 +269,15 @@ def sync_catalog(
                     )
                 )
                 if refresh or existing is None or reference_missing:
-                    pending_ids.append((existing[3] if existing else "", set_id, card_id))
+                    pending_ids.append(
+                        (
+                            existing[3] if existing else "",
+                            set_id,
+                            card_id,
+                            existing[1] if existing else None,
+                            existing[2] if existing else None,
+                        )
+                    )
                     if not refresh and limit is not None and len(pending_ids) >= limit:
                         break
             if not refresh and limit is not None and len(pending_ids) >= limit:
@@ -171,38 +286,39 @@ def sync_catalog(
         pending_ids.sort()
         if limit is not None:
             pending_ids = pending_ids[:limit]
-        for _, set_id, card_id in track(
-            pending_ids, description="Syncing Pokemon card details"
+
+        for item, future in track(
+            iter_fetched_cards(
+                pending_ids,
+                images_dir,
+                download_images=download_images,
+                image_budget=image_budget,
+                workers=workers,
+            ),
+            total=len(pending_ids),
+            description="Syncing Pokemon card details",
         ):
+            _, set_id, card_id, _, _ = item
             try:
-                detail = request_json(session, f"{API_URL}/cards/{card_id}")
+                (
+                    detail,
+                    cached_image_url,
+                    stored_image_path,
+                    image_downloaded,
+                    image_error,
+                ) = future.result()
+            except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+                failed += 1
+                print(f"Failed card {card_id}: {error}")
+                continue
+
+            if image_downloaded:
+                downloaded += 1
+            if image_error:
+                failed += 1
+                print(f"Failed image {card_id}: {image_error}")
+            try:
                 image_url = detail.get("image")
-                image_path = images_dir / f"{card_id}.jpg"
-                previous_image = connection.execute(
-                    "SELECT cached_image_url, image_path FROM pokemon_cards WHERE card_id = ?",
-                    (card_id,),
-                ).fetchone()
-                cached_image_url = previous_image[0] if previous_image else None
-                stored_image_path = previous_image[1] if previous_image else None
-                if (
-                    download_images
-                    and image_url
-                    and (
-                        not image_path.is_file()
-                        or cached_image_url != image_url
-                        or stored_image_path != str(image_path)
-                    )
-                    and (image_limit is None or image_attempts < image_limit)
-                ):
-                    image_attempts += 1
-                    try:
-                        cache_image(session, image_url, image_path)
-                        cached_image_url = image_url
-                        stored_image_path = str(image_path)
-                        downloaded += 1
-                    except (OSError, requests.RequestException, ValueError) as error:
-                        failed += 1
-                        print(f"Failed image {card_id}: {error}")
                 card_set = detail.get("set") or {}
                 cardmarket = (detail.get("pricing") or {}).get("cardmarket") or {}
                 tcgplayer = (detail.get("pricing") or {}).get("tcgplayer") or {}
@@ -314,6 +430,11 @@ def sync_catalog(
                 print(f"Failed card {card_id}: {error}")
     finally:
         session.close()
+        with _WORKER_SESSIONS_LOCK:
+            worker_sessions = list(_WORKER_SESSIONS)
+            _WORKER_SESSIONS.clear()
+        for worker_session_to_close in worker_sessions:
+            worker_session_to_close.close()
         connection.close()
 
     print(f"Pokemon cards synced: {processed}; failed requests/images: {failed}")
@@ -346,17 +467,24 @@ def main() -> None:
         action="store_true",
         help="Refetch existing card details and update cached metadata and prices.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrent network workers (default: 8; requests remain globally paced).",
+    )
     args = parser.parse_args()
     if (args.limit is not None and args.limit <= 0) or (
         args.image_limit is not None and args.image_limit <= 0
-    ):
-        parser.error("--limit and --image-limit must be greater than zero")
+    ) or args.workers <= 0:
+        parser.error("--limit, --image-limit, and --workers must be greater than zero")
     _, _, failed = sync_catalog(
         args.data_dir,
         download_images=args.download_images,
         limit=args.limit,
         image_limit=args.image_limit,
         refresh=args.refresh,
+        workers=args.workers,
     )
     if failed:
         raise SystemExit(1)

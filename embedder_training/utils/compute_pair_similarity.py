@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-DEFAULT_MODEL = "matteot11/collector-mtg-embedder-dinov3-small"
+DEFAULT_MODEL = "matteot11/collector-mtg-pkm-embedder-dinov3-small"
 
 
 def import_runtime():
